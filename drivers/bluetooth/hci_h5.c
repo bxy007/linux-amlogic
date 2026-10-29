@@ -415,6 +415,13 @@ static int h5_rx_3wire_hdr(struct hci_uart *hu, unsigned char c)
 	if (H5_HDR_RELIABLE(hdr) && H5_HDR_SEQ(hdr) != h5->tx_ack) {
 		BT_ERR("Out-of-order packet arrived (%u != %u)",
 		       H5_HDR_SEQ(hdr), h5->tx_ack);
+		/* A missed pure ACK makes the controller retransmit. Dropping
+		 * that packet without another ACK leaves its TX window full.
+		 * Core spec: every reliable packet gets an acknowledgement.
+		 * Same recovery as Linux 3c0d41f141c9.
+		 */
+		set_bit(H5_TX_ACK_REQ, &h5->flags);
+		hci_uart_tx_wakeup(hu);
 		h5_reset_rx(h5);
 		return 0;
 	}
