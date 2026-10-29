@@ -1891,6 +1891,9 @@ static void hci_cs_exit_sniff_mode(struct hci_dev *hdev, __u8 status)
 	hci_dev_unlock(hdev);
 }
 
+static void hci_conn_finish_disconnect(struct hci_dev *hdev,
+				       struct hci_conn *conn, u8 reason);
+
 static void hci_cs_disconnect(struct hci_dev *hdev, u8 status)
 {
 	struct hci_cp_disconnect *cp;
@@ -1906,9 +1909,18 @@ static void hci_cs_disconnect(struct hci_dev *hdev, u8 status)
 	hci_dev_lock(hdev);
 
 	conn = hci_conn_hash_lookup_handle(hdev, __le16_to_cpu(cp->handle));
-	if (conn)
-		mgmt_disconnect_failed(hdev, &conn->dst, conn->type,
-				       conn->dst_type, status);
+	if (conn) {
+		/* Controller has already forgotten this handle. A failed
+		 * status does not clear BlueZ Connected, and no Disconnection
+		 * Complete will follow, so drop the host object here.
+		 */
+		if (status == HCI_ERROR_UNKNOWN_CONN_ID)
+			hci_conn_finish_disconnect(hdev, conn,
+						   HCI_ERROR_LOCAL_HOST_TERM);
+		else
+			mgmt_disconnect_failed(hdev, &conn->dst, conn->type,
+					       conn->dst_type, status);
+	}
 
 	hci_dev_unlock(hdev);
 }
@@ -2347,40 +2359,30 @@ static u8 hci_to_mgmt_reason(u8 err)
 	}
 }
 
-static void hci_disconn_complete_evt(struct hci_dev *hdev, struct sk_buff *skb)
+/* hdev->lock must be held. Same cleanup as a successful Disconnection
+ * Complete: notify MGMT, drop L2CAP, and remove the conn. Used when the
+ * controller reports Unknown Connection Identifier or the host object is
+ * already BT_DISCONN/BT_CLOSED and no complete event will arrive.
+ */
+static void hci_conn_finish_disconnect(struct hci_dev *hdev,
+				       struct hci_conn *conn, u8 reason)
 {
-	struct hci_ev_disconn_complete *ev = (void *) skb->data;
-	u8 reason;
 	struct hci_conn_params *params;
-	struct hci_conn *conn;
 	bool mgmt_connected;
-	u8 type;
-
-	BT_DBG("%s status 0x%2.2x", hdev->name, ev->status);
-
-	hci_dev_lock(hdev);
-
-	conn = hci_conn_hash_lookup_handle(hdev, __le16_to_cpu(ev->handle));
-	if (!conn)
-		goto unlock;
-
-	if (ev->status) {
-		mgmt_disconnect_failed(hdev, &conn->dst, conn->type,
-				       conn->dst_type, ev->status);
-		goto unlock;
-	}
+	u8 mgmt_reason, type;
 
 	conn->state = BT_CLOSED;
 
-	mgmt_connected = test_and_clear_bit(HCI_CONN_MGMT_CONNECTED, &conn->flags);
+	mgmt_connected = test_and_clear_bit(HCI_CONN_MGMT_CONNECTED,
+					    &conn->flags);
 
 	if (test_bit(HCI_CONN_AUTH_FAILURE, &conn->flags))
-		reason = MGMT_DEV_DISCONN_AUTH_FAILURE;
+		mgmt_reason = MGMT_DEV_DISCONN_AUTH_FAILURE;
 	else
-		reason = hci_to_mgmt_reason(ev->reason);
+		mgmt_reason = hci_to_mgmt_reason(reason);
 
 	mgmt_device_disconnected(hdev, &conn->dst, conn->type, conn->dst_type,
-				reason, mgmt_connected);
+				 mgmt_reason, mgmt_connected);
 
 	if (conn->type == ACL_LINK) {
 		if (test_bit(HCI_CONN_FLUSH_KEY, &conn->flags))
@@ -2393,7 +2395,7 @@ static void hci_disconn_complete_evt(struct hci_dev *hdev, struct sk_buff *skb)
 	if (params) {
 		switch (params->auto_connect) {
 		case HCI_AUTO_CONN_LINK_LOSS:
-			if (ev->reason != HCI_ERROR_CONNECTION_TIMEOUT)
+			if (reason != HCI_ERROR_CONNECTION_TIMEOUT)
 				break;
 			/* Fall through */
 
@@ -2411,21 +2413,42 @@ static void hci_disconn_complete_evt(struct hci_dev *hdev, struct sk_buff *skb)
 
 	type = conn->type;
 
-	hci_disconn_cfm(conn, ev->reason);
+	hci_disconn_cfm(conn, reason);
 	hci_conn_del(conn);
 
-	/* Re-enable advertising if necessary, since it might
-	 * have been disabled by the connection. From the
-	 * HCI_LE_Set_Advertise_Enable command description in
-	 * the core specification (v4.0):
-	 * "The Controller shall continue advertising until the Host
-	 * issues an LE_Set_Advertise_Enable command with
-	 * Advertising_Enable set to 0x00 (Advertising is disabled)
-	 * or until a connection is created or until the Advertising
-	 * is timed out due to Directed Advertising."
+	/* LE advertising stops when a connection is created. Bring it
+	 * back after the conn object is gone. See HCI_LE_Set_Advertise_Enable
+	 * in the Core Specification v4.0.
 	 */
 	if (type == LE_LINK)
 		hci_req_reenable_advertising(hdev);
+}
+
+void hci_conn_force_disconnect(struct hci_conn *conn, u8 reason)
+{
+	hci_conn_finish_disconnect(conn->hdev, conn, reason);
+}
+
+static void hci_disconn_complete_evt(struct hci_dev *hdev, struct sk_buff *skb)
+{
+	struct hci_ev_disconn_complete *ev = (void *) skb->data;
+	struct hci_conn *conn;
+
+	BT_DBG("%s status 0x%2.2x", hdev->name, ev->status);
+
+	hci_dev_lock(hdev);
+
+	conn = hci_conn_hash_lookup_handle(hdev, __le16_to_cpu(ev->handle));
+	if (!conn)
+		goto unlock;
+
+	if (ev->status) {
+		mgmt_disconnect_failed(hdev, &conn->dst, conn->type,
+				       conn->dst_type, ev->status);
+		goto unlock;
+	}
+
+	hci_conn_finish_disconnect(hdev, conn, ev->reason);
 
 unlock:
 	hci_dev_unlock(hdev);

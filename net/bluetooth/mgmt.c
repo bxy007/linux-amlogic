@@ -2340,6 +2340,15 @@ static int unpair_device(struct sock *sk, struct hci_dev *hdev, void *data,
 		conn = NULL;
 
 done:
+	/* Controller already dropped this handle, or a previous disconnect
+	 * never got Disconnection Complete. Finish the host object now so
+	 * Unpair does not wait forever.
+	 */
+	if (conn && (conn->state == BT_CLOSED || conn->state == BT_DISCONN)) {
+		hci_conn_force_disconnect(conn, HCI_ERROR_LOCAL_HOST_TERM);
+		conn = NULL;
+	}
+
 	/* If the connection variable is set, then termination of the
 	 * link is requested.
 	 */
@@ -2410,9 +2419,23 @@ static int disconnect(struct sock *sk, struct hci_dev *hdev, void *data,
 		conn = hci_conn_hash_lookup_le(hdev, &cp->addr.bdaddr,
 					       le_addr_type(cp->addr.type));
 
-	if (!conn || conn->state == BT_OPEN || conn->state == BT_CLOSED) {
+	if (!conn || conn->state == BT_OPEN) {
 		err = mgmt_cmd_complete(sk, hdev->id, MGMT_OP_DISCONNECT,
 					MGMT_STATUS_NOT_CONNECTED, &rp,
+					sizeof(rp));
+		goto failed;
+	}
+
+	/* BT_CLOSED: abort already marked the conn dead without telling
+	 * BlueZ. BT_DISCONN: Disconnect was sent but the controller never
+	 * completed it (Realtek often answers Unknown Connection Id, or
+	 * nothing at all). Both leave Device1.Connected true and the
+	 * MGMT request pending, so the D-Bus method hangs.
+	 */
+	if (conn->state == BT_CLOSED || conn->state == BT_DISCONN) {
+		hci_conn_force_disconnect(conn, HCI_ERROR_LOCAL_HOST_TERM);
+		err = mgmt_cmd_complete(sk, hdev->id, MGMT_OP_DISCONNECT,
+					MGMT_STATUS_SUCCESS, &rp,
 					sizeof(rp));
 		goto failed;
 	}
