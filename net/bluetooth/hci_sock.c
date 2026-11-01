@@ -1469,7 +1469,7 @@ static int hci_mgmt_cmd(struct hci_mgmt_chan *chan, struct sock *sk,
 	u16 opcode, index, len;
 	struct hci_dev *hdev = NULL;
 	const struct hci_mgmt_handler *handler;
-	bool var_len, no_hdev;
+	bool var_len;
 	int err;
 
 	BT_DBG("got %zu bytes", msglen);
@@ -1550,8 +1550,7 @@ static int hci_mgmt_cmd(struct hci_mgmt_chan *chan, struct sock *sk,
 		}
 	}
 
-	no_hdev = (handler->flags & HCI_MGMT_NO_HDEV);
-	if (no_hdev != !hdev) {
+	if (!hci_mgmt_index_valid(handler, !!hdev)) {
 		err = mgmt_cmd_status(sk, index, opcode,
 				      MGMT_STATUS_INVALID_INDEX);
 		goto done;

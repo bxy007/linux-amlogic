@@ -674,6 +674,42 @@ struct hci_dev *hci_get_route(bdaddr_t *dst, bdaddr_t *src, uint8_t src_type)
 }
 EXPORT_SYMBOL(hci_get_route);
 
+/* Device Privacy Mode permits identity addresses for legacy bonds whose peer
+ * never received this host's IRK. Learn per bond from the actual link/timeout,
+ * rather than assuming that possession of a peer IRK proves mutual privacy.
+ * Strict Network Privacy Mode and key/authentication failures never fall back.
+ */
+void hci_le_conn_update_privacy(struct hci_conn *conn,
+				struct hci_conn_params *params, u8 status)
+{
+	struct hci_dev *hdev = conn->hdev;
+
+	if (!conn->out || !params || !hci_ll_privacy_enabled(hdev) ||
+	    !hci_dev_test_flag(hdev, HCI_PRIVACY) ||
+	    !(params->current_flags & HCI_CONN_FLAG_DEVICE_PRIVACY) ||
+	    !hci_find_irk_by_addr(hdev, &conn->dst, conn->dst_type))
+		return;
+
+	if (!status) {
+		params->use_identity_addr = !hci_bdaddr_is_rpa(&conn->init_addr,
+							    conn->init_addr_type);
+		return;
+	}
+	if (!test_bit(HCI_CONN_LE_ADDR_FALLBACK, &conn->flags))
+		return;
+	if (status == HCI_ERROR_UNKNOWN_CONN_ID) {
+		/* A quick user cancellation is not evidence about addresses. */
+		if (!conn->le_conn_started ||
+		    time_before(jiffies, conn->le_conn_started + HCI_LE_AUTOCONN_TIMEOUT))
+			return;
+	} else if (status != HCI_ERROR_CONNECTION_TIMEOUT &&
+		   status != HCI_ERROR_CONN_FAILED_TO_ESTABLISH) {
+		return;
+	}
+	params->use_identity_addr =
+		!test_bit(HCI_CONN_LE_IDENTITY_ADDR, &conn->flags);
+}
+
 /* This function requires the caller holds hdev->lock */
 void hci_le_conn_failed(struct hci_conn *conn, u8 status)
 {
@@ -682,6 +718,7 @@ void hci_le_conn_failed(struct hci_conn *conn, u8 status)
 
 	params = hci_pend_le_action_lookup(&hdev->pend_le_conns, &conn->dst,
 					   conn->dst_type);
+	hci_le_conn_update_privacy(conn, params, status);
 	if (params && params->conn) {
 		hci_conn_drop(params->conn);
 		hci_conn_put(params->conn);
@@ -744,6 +781,13 @@ done:
 static bool conn_use_rpa(struct hci_conn *conn)
 {
 	struct hci_dev *hdev = conn->hdev;
+	struct hci_conn_params *params;
+
+	params = hci_conn_params_lookup(hdev, &conn->dst, conn->dst_type);
+	if (conn->out && hci_ll_privacy_enabled(hdev) && params &&
+	    (params->current_flags & HCI_CONN_FLAG_DEVICE_PRIVACY) &&
+	    params->use_identity_addr)
+		return false;
 
 	return hci_dev_test_flag(hdev, HCI_PRIVACY);
 }
@@ -754,7 +798,21 @@ static void hci_req_add_le_create_conn(struct hci_request *req,
 {
 	struct hci_cp_le_create_conn cp;
 	struct hci_dev *hdev = conn->hdev;
+	struct hci_conn_params *params;
 	u8 own_addr_type;
+	bool use_rpa = conn_use_rpa(conn);
+
+	params = hci_conn_params_lookup(hdev, &conn->dst, conn->dst_type);
+	clear_bit(HCI_CONN_LE_ADDR_FALLBACK, &conn->flags);
+	clear_bit(HCI_CONN_LE_IDENTITY_ADDR, &conn->flags);
+	if (!direct_rpa && hci_ll_privacy_enabled(hdev) && params &&
+	    (params->current_flags & HCI_CONN_FLAG_DEVICE_PRIVACY) &&
+	    hci_dev_test_flag(hdev, HCI_PRIVACY) &&
+	    hci_find_irk_by_addr(hdev, &conn->dst, conn->dst_type)) {
+		set_bit(HCI_CONN_LE_ADDR_FALLBACK, &conn->flags);
+		if (!use_rpa)
+			set_bit(HCI_CONN_LE_IDENTITY_ADDR, &conn->flags);
+	}
 
 	/* If direct address was provided we use it instead of current
 	 * address.
@@ -770,7 +828,7 @@ static void hci_req_add_le_create_conn(struct hci_request *req,
 		/* Update random address, but set require_privacy to false so
 		 * that we never connect with an non-resolvable address.
 		 */
-		if (hci_update_random_address(req, false, conn_use_rpa(conn),
+		if (hci_update_random_address(req, false, use_rpa,
 					      &own_addr_type))
 			return;
 	}
@@ -785,6 +843,20 @@ static void hci_req_add_le_create_conn(struct hci_request *req,
 
 	bacpy(&cp.peer_addr, &conn->dst);
 	cp.peer_addr_type = conn->dst_type;
+	if (!direct_rpa && hci_ll_privacy_resolving(hdev) &&
+	    hci_find_irk_by_addr(hdev, &conn->dst, conn->dst_type) &&
+	    hci_bdaddr_list_lookup_with_irk(&hdev->le_resolv_list,
+					   &conn->dst, conn->dst_type)) {
+		u8 enable = use_rpa || !params || params->peer_uses_rpa;
+
+		/* A legacy identity-to-identity attempt needs no resolving list.
+		 * Keep resolution when the peer actually advertised with an RPA;
+		 * otherwise reproduce the original public/static-address path.
+		 */
+		hci_req_add(req, HCI_OP_LE_SET_ADDR_RESOLV_ENABLE, 1, &enable);
+		if (use_rpa)
+			own_addr_type = hci_req_ll_own_addr_type(hdev);
+	}
 	cp.own_address_type = own_addr_type;
 	cp.conn_interval_min = cpu_to_le16(conn->le_conn_min_interval);
 	cp.conn_interval_max = cpu_to_le16(conn->le_conn_max_interval);
@@ -806,13 +878,6 @@ static void hci_req_directed_advertising(struct hci_request *req,
 	struct hci_cp_le_set_adv_param cp;
 	u8 own_addr_type;
 	u8 enable;
-
-	/* Clear the HCI_LE_ADV bit temporarily so that the
-	 * hci_update_random_address knows that it's safe to go ahead
-	 * and write a new random address. The flag will be set back on
-	 * as soon as the SET_ADV_ENABLE HCI command completes.
-	 */
-	hci_dev_clear_flag(hdev, HCI_LE_ADV);
 
 	/* Set require_privacy to false so that the remote device has a
 	 * chance of identifying us.
@@ -880,7 +945,9 @@ struct hci_conn *hci_connect_le(struct hci_dev *hdev, bdaddr_t *dst,
 	 * from the connect request.
 	 */
 	irk = hci_find_irk_by_addr(hdev, dst, dst_type);
-	if (irk && bacmp(&irk->rpa, BDADDR_ANY)) {
+	if (irk && bacmp(&irk->rpa, BDADDR_ANY) &&
+	    !(hci_ll_privacy_resolving(hdev) &&
+	      hci_bdaddr_list_lookup_with_irk(&hdev->le_resolv_list, dst, dst_type))) {
 		dst = &irk->rpa;
 		dst_type = ADDR_LE_DEV_RANDOM;
 	}
@@ -925,6 +992,8 @@ struct hci_conn *hci_connect_le(struct hci_dev *hdev, bdaddr_t *dst,
 			return ERR_PTR(-EBUSY);
 		}
 
+		if (hci_dev_test_flag(hdev, HCI_LE_SCAN))
+			hci_req_add_le_scan_disable(&req, true);
 		hci_req_directed_advertising(&req, conn);
 		goto create_conn;
 	}
@@ -949,7 +1018,7 @@ struct hci_conn *hci_connect_le(struct hci_dev *hdev, bdaddr_t *dst,
 	 * state.
 	 */
 	if (hci_dev_test_flag(hdev, HCI_LE_SCAN)) {
-		hci_req_add_le_scan_disable(&req);
+		hci_req_add_le_scan_disable(&req, true);
 		hci_dev_set_flag(hdev, HCI_LE_SCAN_INTERRUPTED);
 	}
 

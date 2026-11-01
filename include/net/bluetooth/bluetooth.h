@@ -301,6 +301,7 @@ typedef void (*hci_req_complete_skb_t)(struct hci_dev *hdev, u8 status,
 
 #define HCI_REQ_START	BIT(0)
 #define HCI_REQ_SKB	BIT(1)
+#define HCI_REQ_SCAN_PAUSE	BIT(2)
 
 struct hci_ctrl {
 	__u16 opcode;

@@ -106,6 +106,10 @@ static const u16 mgmt_commands[] = {
 	MGMT_OP_START_LIMITED_DISCOVERY,
 	MGMT_OP_READ_EXT_INFO,
 	MGMT_OP_SET_APPEARANCE,
+	MGMT_OP_READ_EXP_FEATURES_INFO,
+	MGMT_OP_SET_EXP_FEATURE,
+	MGMT_OP_GET_DEVICE_FLAGS,
+	MGMT_OP_SET_DEVICE_FLAGS,
 };
 
 static const u16 mgmt_events[] = {
@@ -144,6 +148,8 @@ static const u16 mgmt_events[] = {
 	MGMT_EV_ADVERTISING_ADDED,
 	MGMT_EV_ADVERTISING_REMOVED,
 	MGMT_EV_EXT_INFO_CHANGED,
+	MGMT_EV_EXP_FEATURE_CHANGED,
+	MGMT_EV_DEVICE_FLAGS_CHANGED,
 };
 
 static const u16 mgmt_untrusted_commands[] = {
@@ -3950,6 +3956,11 @@ static void set_advertising_complete(struct hci_dev *hdev, u8 status,
 	    list_empty(&hdev->adv_instances))
 		goto unlock;
 
+	if (hci_ll_privacy_enabled(hdev)) {
+		hci_update_background_scan(hdev);
+		goto unlock;
+	}
+
 	instance = hdev->cur_adv_instance;
 	if (!instance) {
 		adv_instance = list_first_entry_or_null(&hdev->adv_instances,
@@ -3994,6 +4005,7 @@ static int set_advertising(struct sock *sk, struct hci_dev *hdev, void *data,
 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_SET_ADVERTISING,
 				       MGMT_STATUS_INVALID_PARAMS);
 
+	hci_req_sync_lock(hdev);
 	hci_dev_lock(hdev);
 
 	val = !!cp->val;
@@ -4006,7 +4018,8 @@ static int set_advertising(struct sock *sk, struct hci_dev *hdev, void *data,
 	if (!hdev_is_powered(hdev) ||
 	    (val == hci_dev_test_flag(hdev, HCI_ADVERTISING) &&
 	     (cp->val == 0x02) == hci_dev_test_flag(hdev, HCI_ADVERTISING_CONNECTABLE)) ||
-	    hci_conn_num(hdev, LE_LINK) > 0 ||
+	    (cp->val && !hci_req_advertising_allowed(hdev,
+			(cp->val == 0x02) || mgmt_get_connectable(hdev))) ||
 	    (hci_dev_test_flag(hdev, HCI_LE_SCAN) &&
 	     hdev->le_scan_type == LE_SCAN_ACTIVE)) {
 		bool changed;
@@ -4074,6 +4087,7 @@ static int set_advertising(struct sock *sk, struct hci_dev *hdev, void *data,
 
 unlock:
 	hci_dev_unlock(hdev);
+	hci_req_sync_unlock(hdev);
 	return err;
 }
 
@@ -4163,14 +4177,7 @@ static int set_scan_params(struct sock *sk, struct hci_dev *hdev,
 	 */
 	if (hci_dev_test_flag(hdev, HCI_LE_SCAN) &&
 	    hdev->discovery.state == DISCOVERY_STOPPED) {
-		struct hci_request req;
-
-		hci_req_init(&req, hdev);
-
-		hci_req_add_le_scan_disable(&req);
-		hci_req_add_le_passive_scan(&req);
-
-		hci_req_run(&req, NULL);
+		hci_update_background_scan(hdev);
 	}
 
 	hci_dev_unlock(hdev);
@@ -4599,6 +4606,172 @@ static int set_debug_keys(struct sock *sk, struct hci_dev *hdev,
 unlock:
 	hci_dev_unlock(hdev);
 	return err;
+}
+
+/* Standard BlueZ MGMT interfaces, adapted from upstream LL Privacy support. */
+static const u8 rpa_resolution_uuid[16] = {
+	0x04, 0x00, 0x13, 0xac, 0x42, 0x02, 0xde, 0xb3,
+	0xea, 0x11, 0x73, 0xc2, 0x48, 0xa1, 0xc0, 0x15,
+};
+
+static int read_exp_features_info(struct sock *sk, struct hci_dev *hdev,
+				  void *data, u16 len)
+{
+	struct {
+		__le16 count;
+		u8 uuid[16];
+		__le32 flags;
+	} __packed rp;
+	u16 size = sizeof(rp.count);
+
+	memset(&rp, 0, sizeof(rp));
+	if (hdev && hci_ll_privacy_capable(hdev)) {
+		rp.count = cpu_to_le16(1);
+		memcpy(rp.uuid, rpa_resolution_uuid, sizeof(rp.uuid));
+		rp.flags = cpu_to_le32(BIT(1) |
+			(hci_dev_test_flag(hdev, HCI_ENABLE_LL_PRIVACY) ? BIT(0) : 0));
+		size = sizeof(rp);
+	}
+	hci_sock_set_flag(sk, HCI_MGMT_EXP_FEATURE_EVENTS);
+	return mgmt_cmd_complete(sk, hdev ? hdev->id : MGMT_INDEX_NONE,
+				 MGMT_OP_READ_EXP_FEATURES_INFO, 0, &rp, size);
+}
+
+static int set_exp_feature(struct sock *sk, struct hci_dev *hdev,
+			   void *data, u16 len)
+{
+	struct mgmt_cp_set_exp_feature *cp = data;
+	struct mgmt_rp_set_exp_feature rp;
+	struct mgmt_ev_exp_feature_changed ev;
+	static const u8 zero_uuid[16];
+	bool reset = !memcmp(cp->uuid, zero_uuid, sizeof(zero_uuid));
+	bool enabled, changed;
+	int err;
+	u16 index = hdev ? hdev->id : MGMT_INDEX_NONE;
+
+	if (reset && !hdev) {
+		memset(&rp, 0, sizeof(rp));
+		return mgmt_cmd_complete(sk, index, MGMT_OP_SET_EXP_FEATURE, 0,
+					 &rp, sizeof(rp));
+	}
+	if (!hdev)
+		return mgmt_cmd_status(sk, index, MGMT_OP_SET_EXP_FEATURE,
+				       MGMT_STATUS_INVALID_INDEX);
+	if (!reset && memcmp(cp->uuid, rpa_resolution_uuid, 16))
+		return mgmt_cmd_status(sk, index, MGMT_OP_SET_EXP_FEATURE,
+				       MGMT_STATUS_NOT_SUPPORTED);
+	if (!hci_ll_privacy_capable(hdev))
+		return mgmt_cmd_status(sk, index, MGMT_OP_SET_EXP_FEATURE,
+				       MGMT_STATUS_NOT_SUPPORTED);
+	if ((!reset && len != sizeof(*cp) + 1) ||
+	    (reset && len != sizeof(*cp)) || (!reset && cp->param[0] > 1))
+		return mgmt_cmd_status(sk, index, MGMT_OP_SET_EXP_FEATURE,
+				       MGMT_STATUS_INVALID_PARAMS);
+
+	hci_dev_lock(hdev);
+	if (hdev_is_powered(hdev)) {
+		err = mgmt_cmd_status(sk, index, MGMT_OP_SET_EXP_FEATURE,
+				      MGMT_STATUS_REJECTED);
+		goto unlock;
+	}
+	enabled = !reset && cp->param[0];
+	if (enabled) {
+		changed = !hci_dev_test_and_set_flag(hdev, HCI_ENABLE_LL_PRIVACY);
+	} else {
+		changed = hci_dev_test_and_clear_flag(hdev, HCI_ENABLE_LL_PRIVACY);
+	}
+	memset(&rp, 0, sizeof(rp));
+	memcpy(rp.uuid, rpa_resolution_uuid, 16);
+	rp.flags = cpu_to_le32(BIT(1) | (enabled ? BIT(0) : 0));
+	hci_sock_set_flag(sk, HCI_MGMT_EXP_FEATURE_EVENTS);
+	err = mgmt_cmd_complete(sk, index, MGMT_OP_SET_EXP_FEATURE, 0,
+				 &rp, sizeof(rp));
+	if (changed) {
+		memcpy(ev.uuid, rp.uuid, sizeof(ev.uuid));
+		ev.flags = rp.flags;
+		mgmt_limited_event(MGMT_EV_EXP_FEATURE_CHANGED, hdev, &ev,
+				   sizeof(ev), HCI_MGMT_EXP_FEATURE_EVENTS, sk);
+	}
+unlock:
+	hci_dev_unlock(hdev);
+	return err;
+}
+
+static u32 supported_device_flags(struct hci_dev *hdev, u8 type)
+{
+	/* Do not advertise wake-from-suspend or BR/EDR flags that 4.9 does
+	 * not implement. Device Privacy Mode is a separate optional command.
+	 */
+	if ((type == BDADDR_LE_PUBLIC || type == BDADDR_LE_RANDOM) &&
+	    hci_ll_privacy_enabled(hdev) && (hdev->commands[39] & 0x04))
+		return HCI_CONN_FLAG_DEVICE_PRIVACY;
+	return 0;
+}
+
+static void device_flags_changed(struct sock *sk, struct hci_dev *hdev,
+				 bdaddr_t *addr, u8 type, u32 flags)
+{
+	struct mgmt_ev_device_flags_changed ev;
+
+	bacpy(&ev.addr.bdaddr, addr);
+	ev.addr.type = type;
+	ev.supported_flags = cpu_to_le32(supported_device_flags(hdev, type));
+	ev.current_flags = cpu_to_le32(flags);
+	mgmt_event(MGMT_EV_DEVICE_FLAGS_CHANGED, hdev, &ev, sizeof(ev), sk);
+}
+
+static int get_device_flags(struct sock *sk, struct hci_dev *hdev,
+			    void *data, u16 len)
+{
+	struct mgmt_cp_get_device_flags *cp = data;
+	struct mgmt_rp_get_device_flags rp;
+	struct hci_conn_params *params;
+	u8 status = MGMT_STATUS_INVALID_PARAMS;
+
+	memset(&rp, 0, sizeof(rp));
+	if (cp->addr.type != BDADDR_LE_PUBLIC && cp->addr.type != BDADDR_LE_RANDOM)
+		goto done;
+	hci_dev_lock(hdev);
+	params = hci_conn_params_lookup(hdev, &cp->addr.bdaddr,
+					le_addr_type(cp->addr.type));
+	if (params) {
+		rp.addr = cp->addr;
+		rp.supported_flags = cpu_to_le32(supported_device_flags(hdev,
+								 cp->addr.type));
+		rp.current_flags = cpu_to_le32(params->current_flags);
+		status = MGMT_STATUS_SUCCESS;
+	}
+	hci_dev_unlock(hdev);
+done:
+	return mgmt_cmd_complete(sk, hdev->id, MGMT_OP_GET_DEVICE_FLAGS,
+				 status, &rp, sizeof(rp));
+}
+
+static int set_device_flags(struct sock *sk, struct hci_dev *hdev,
+			    void *data, u16 len)
+{
+	struct mgmt_cp_set_device_flags *cp = data;
+	struct hci_conn_params *params;
+	u32 flags = le32_to_cpu(cp->current_flags);
+	u8 status = MGMT_STATUS_INVALID_PARAMS;
+
+	if ((cp->addr.type != BDADDR_LE_PUBLIC && cp->addr.type != BDADDR_LE_RANDOM) ||
+	    (flags & ~supported_device_flags(hdev, cp->addr.type)))
+		goto done;
+	hci_dev_lock(hdev);
+	params = hci_conn_params_lookup(hdev, &cp->addr.bdaddr,
+					le_addr_type(cp->addr.type));
+	if (params) {
+		params->current_flags = flags;
+		hci_update_background_scan(hdev);
+		status = MGMT_STATUS_SUCCESS;
+	}
+	hci_dev_unlock(hdev);
+	if (status == MGMT_STATUS_SUCCESS)
+		device_flags_changed(sk, hdev, &cp->addr.bdaddr, cp->addr.type, flags);
+done:
+	return mgmt_cmd_complete(sk, hdev->id, MGMT_OP_SET_DEVICE_FLAGS,
+				 status, &cp->addr, sizeof(cp->addr));
 }
 
 static int set_privacy(struct sock *sk, struct hci_dev *hdev, void *cp_data,
@@ -5264,6 +5437,8 @@ static int add_device(struct sock *sk, struct hci_dev *hdev,
 {
 	struct mgmt_cp_add_device *cp = data;
 	u8 auto_conn, addr_type;
+	struct hci_conn_params *params;
+	u32 flags = 0;
 	int err;
 
 	BT_DBG("%s", hdev->name);
@@ -5333,9 +5508,13 @@ static int add_device(struct sock *sk, struct hci_dev *hdev,
 		goto unlock;
 	}
 
+	params = hci_conn_params_lookup(hdev, &cp->addr.bdaddr, addr_type);
+	if (params)
+		flags = params->current_flags;
 	hci_update_background_scan(hdev);
 
 added:
+	device_flags_changed(NULL, hdev, &cp->addr.bdaddr, cp->addr.type, flags);
 	device_added(sk, hdev, &cp->addr.bdaddr, cp->addr.type, cp->action);
 
 	err = mgmt_cmd_complete(sk, hdev->id, MGMT_OP_ADD_DEVICE,
@@ -6232,6 +6411,7 @@ static int add_advertising(struct sock *sk, struct hci_dev *hdev,
 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_ADVERTISING,
 				       MGMT_STATUS_INVALID_PARAMS);
 
+	hci_req_sync_lock(hdev);
 	hci_dev_lock(hdev);
 
 	if (timeout && !hdev_is_powered(hdev)) {
@@ -6326,6 +6506,7 @@ static int add_advertising(struct sock *sk, struct hci_dev *hdev,
 
 unlock:
 	hci_dev_unlock(hdev);
+	hci_req_sync_unlock(hdev);
 
 	return err;
 }
@@ -6371,6 +6552,7 @@ static int remove_advertising(struct sock *sk, struct hci_dev *hdev,
 
 	BT_DBG("%s", hdev->name);
 
+	hci_req_sync_lock(hdev);
 	hci_dev_lock(hdev);
 
 	if (cp->instance && !hci_find_adv_instance(hdev, cp->instance)) {
@@ -6428,6 +6610,7 @@ static int remove_advertising(struct sock *sk, struct hci_dev *hdev,
 
 unlock:
 	hci_dev_unlock(hdev);
+	hci_req_sync_unlock(hdev);
 
 	return err;
 }
@@ -6563,6 +6746,16 @@ static const struct hci_mgmt_handler mgmt_handlers[] = {
 	{ read_ext_controller_info,MGMT_READ_EXT_INFO_SIZE,
 						HCI_MGMT_UNTRUSTED },
 	{ set_appearance,	   MGMT_SET_APPEARANCE_SIZE },
+	[MGMT_OP_READ_EXP_FEATURES_INFO] = {
+		read_exp_features_info, MGMT_READ_EXP_FEATURES_INFO_SIZE,
+		HCI_MGMT_HDEV_OPTIONAL | HCI_MGMT_UNTRUSTED },
+	[MGMT_OP_SET_EXP_FEATURE] = {
+		set_exp_feature, MGMT_SET_EXP_FEATURE_SIZE,
+		HCI_MGMT_HDEV_OPTIONAL | HCI_MGMT_VAR_LEN },
+	[MGMT_OP_GET_DEVICE_FLAGS] = {
+		get_device_flags, MGMT_GET_DEVICE_FLAGS_SIZE },
+	[MGMT_OP_SET_DEVICE_FLAGS] = {
+		set_device_flags, MGMT_SET_DEVICE_FLAGS_SIZE },
 };
 
 void mgmt_index_added(struct hci_dev *hdev)

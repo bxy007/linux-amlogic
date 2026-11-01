@@ -128,6 +128,15 @@ struct smp_ltk {
 	u8 val[16];
 };
 
+struct bdaddr_list_with_irk {
+	struct list_head list;
+	bdaddr_t bdaddr;
+	u8 bdaddr_type;
+	u8 peer_irk[16];
+	u8 local_irk[16];
+	u8 privacy_mode;
+};
+
 struct smp_irk {
 	struct list_head list;
 	struct rcu_head rcu;
@@ -222,6 +231,7 @@ struct hci_dev {
 	__u8		features[HCI_MAX_PAGES][8];
 	__u8		le_features[8];
 	__u8		le_white_list_size;
+	__u8		le_resolv_list_size;
 	__u8		le_states[8];
 	__u8		commands[64];
 	__u8		hci_ver;
@@ -368,6 +378,7 @@ struct hci_dev {
 	struct list_head	identity_resolving_keys;
 	struct list_head	remote_oob_data;
 	struct list_head	le_white_list;
+	struct list_head	le_resolv_list;
 	struct list_head	le_conn_params;
 	struct list_head	pend_le_conns;
 	struct list_head	pend_le_reports;
@@ -488,6 +499,7 @@ struct hci_conn {
 	struct delayed_work auto_accept_work;
 	struct delayed_work idle_work;
 	struct delayed_work le_conn_timeout;
+	unsigned long le_conn_started;
 	struct work_struct  le_scan_cleanup;
 
 	struct device	dev;
@@ -538,6 +550,9 @@ struct hci_conn_params {
 
 	struct hci_conn *conn;
 	bool explicit_connect;
+	u32 current_flags;
+	bool use_identity_addr;
+	bool peer_uses_rpa;
 };
 
 extern struct list_head hci_dev_list;
@@ -664,6 +679,8 @@ enum {
 	HCI_CONN_NEW_LINK_KEY,
 	HCI_CONN_SCANNING,
 	HCI_CONN_AUTH_FAILURE,
+	HCI_CONN_LE_ADDR_FALLBACK,
+	HCI_CONN_LE_IDENTITY_ADDR,
 };
 
 static inline bool hci_conn_ssp_enabled(struct hci_conn *conn)
@@ -913,6 +930,8 @@ int hci_conn_switch_role(struct hci_conn *conn, __u8 role);
 void hci_conn_enter_active_mode(struct hci_conn *conn, __u8 force_active);
 
 void hci_le_conn_failed(struct hci_conn *conn, u8 status);
+void hci_le_conn_update_privacy(struct hci_conn *conn,
+				struct hci_conn_params *params, u8 status);
 
 /*
  * hci_conn_get() and hci_conn_put() are used to control the life-time of an
@@ -1090,6 +1109,38 @@ struct smp_irk *hci_add_irk(struct hci_dev *hdev, bdaddr_t *bdaddr,
 			    u8 addr_type, u8 val[16], bdaddr_t *rpa);
 void hci_remove_irk(struct hci_dev *hdev, bdaddr_t *bdaddr, u8 addr_type);
 void hci_smp_irks_clear(struct hci_dev *hdev);
+
+struct bdaddr_list_with_irk *hci_bdaddr_list_lookup_with_irk(
+		struct list_head *list, bdaddr_t *addr, u8 type);
+int hci_bdaddr_list_add_with_irk(struct list_head *list, bdaddr_t *addr,
+			       u8 type, u8 *peer_irk, u8 *local_irk);
+int hci_bdaddr_list_del_with_irk(struct list_head *list, bdaddr_t *addr, u8 type);
+
+/* LL Privacy is opt-in through the standard MGMT experimental feature. */
+#define use_ll_privacy(dev) ((dev)->le_features[0] & HCI_LE_LL_PRIVACY)
+#define HCI_CONN_FLAG_DEVICE_PRIVACY BIT(1)
+static inline bool hci_ll_privacy_capable(struct hci_dev *hdev)
+{
+	return use_ll_privacy(hdev) && hdev->le_resolv_list_size &&
+	       (hdev->commands[34] & 0x78) == 0x78 &&
+	       (hdev->commands[35] & 0x02);
+}
+
+static inline bool hci_ll_privacy_enabled(struct hci_dev *hdev)
+{
+	return hci_ll_privacy_capable(hdev) &&
+	       hci_dev_test_flag(hdev, HCI_ENABLE_LL_PRIVACY);
+}
+
+/* A failed list transaction falls back to software scanning. Capability or
+ * opt-in alone does not prove that the hardware is currently resolving.
+ */
+static inline bool hci_ll_privacy_resolving(struct hci_dev *hdev)
+{
+	return hci_ll_privacy_enabled(hdev) &&
+	       hci_dev_test_flag(hdev, HCI_LL_RPA_RESOLUTION);
+}
+
 
 bool hci_bdaddr_is_paired(struct hci_dev *hdev, bdaddr_t *bdaddr, u8 type);
 
@@ -1441,6 +1492,7 @@ void hci_sock_dev_event(struct hci_dev *hdev, int event);
 #define HCI_MGMT_NO_HDEV	BIT(1)
 #define HCI_MGMT_UNTRUSTED	BIT(2)
 #define HCI_MGMT_UNCONFIGURED	BIT(3)
+#define HCI_MGMT_HDEV_OPTIONAL	BIT(4)
 
 struct hci_mgmt_handler {
 	int (*func) (struct sock *sk, struct hci_dev *hdev, void *data,
@@ -1448,6 +1500,13 @@ struct hci_mgmt_handler {
 	size_t data_len;
 	unsigned long flags;
 };
+
+static inline bool hci_mgmt_index_valid(const struct hci_mgmt_handler *handler,
+					bool has_hdev)
+{
+	return (handler->flags & HCI_MGMT_HDEV_OPTIONAL) ||
+	       (!!(handler->flags & HCI_MGMT_NO_HDEV) != has_hdev);
+}
 
 struct hci_mgmt_chan {
 	struct list_head list;

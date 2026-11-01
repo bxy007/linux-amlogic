@@ -690,6 +690,9 @@ static int hci_init3_req(struct hci_request *req, unsigned long opt)
 		if (hdev->commands[34] & 0x04)
 			events[1] |= 0x01;	/* LE Generate DHKey Complete */
 
+		if (use_ll_privacy(hdev))
+			events[1] |= 0x02; /* LE Enhanced Connection Complete */
+
 		hci_req_add(req, HCI_OP_LE_SET_EVENT_MASK, sizeof(events),
 			    events);
 
@@ -707,6 +710,17 @@ static int hci_init3_req(struct hci_request *req, unsigned long opt)
 		if (hdev->commands[26] & 0x80) {
 			/* Clear LE White List */
 			hci_req_add(req, HCI_OP_LE_CLEAR_WHITE_LIST, 0, NULL);
+		}
+
+		if (use_ll_privacy(hdev) && (hdev->commands[34] & 0x40))
+			hci_req_add(req, HCI_OP_LE_READ_RESOLV_LIST_SIZE, 0, NULL);
+		if (use_ll_privacy(hdev) && (hdev->commands[34] & 0x20))
+			hci_req_add(req, HCI_OP_LE_CLEAR_RESOLV_LIST, 0, NULL);
+		if (use_ll_privacy(hdev) && (hdev->commands[35] & 0x04)) {
+			__le16 timeout = cpu_to_le16(hdev->rpa_timeout);
+
+			hci_req_add(req, HCI_OP_LE_SET_RPA_TIMEOUT, sizeof(timeout),
+				    &timeout);
 		}
 
 		if (hdev->le_features[0] & HCI_LE_DATA_LEN_EXT) {
@@ -2734,6 +2748,69 @@ struct bdaddr_list *hci_bdaddr_list_lookup(struct list_head *bdaddr_list,
 	return NULL;
 }
 
+struct bdaddr_list_with_irk *hci_bdaddr_list_lookup_with_irk(
+				struct list_head *bdaddr_list, bdaddr_t *bdaddr,
+				u8 type)
+{
+	struct bdaddr_list_with_irk *b;
+
+	list_for_each_entry(b, bdaddr_list, list) {
+		if (!bacmp(&b->bdaddr, bdaddr) && b->bdaddr_type == type)
+			return b;
+	}
+
+	return NULL;
+}
+
+int hci_bdaddr_list_add_with_irk(struct list_head *list, bdaddr_t *bdaddr,
+					u8 type, u8 *peer_irk, u8 *local_irk)
+{
+	struct bdaddr_list_with_irk *entry;
+
+	if (!bacmp(bdaddr, BDADDR_ANY))
+		return -EBADF;
+
+	if (hci_bdaddr_list_lookup(list, bdaddr, type))
+		return -EEXIST;
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return -ENOMEM;
+
+	bacpy(&entry->bdaddr, bdaddr);
+	entry->bdaddr_type = type;
+
+	if (peer_irk)
+		memcpy(entry->peer_irk, peer_irk, 16);
+
+	if (local_irk)
+		memcpy(entry->local_irk, local_irk, 16);
+
+	list_add(&entry->list, list);
+
+	return 0;
+}
+
+int hci_bdaddr_list_del_with_irk(struct list_head *list, bdaddr_t *bdaddr,
+							u8 type)
+{
+	struct bdaddr_list_with_irk *entry;
+
+	if (!bacmp(bdaddr, BDADDR_ANY)) {
+		hci_bdaddr_list_clear(list);
+		return 0;
+	}
+
+	entry = hci_bdaddr_list_lookup_with_irk(list, bdaddr, type);
+	if (!entry)
+		return -ENOENT;
+
+	list_del(&entry->list);
+	kfree(entry);
+
+	return 0;
+}
+
 void hci_bdaddr_list_clear(struct list_head *bdaddr_list)
 {
 	struct bdaddr_list *b, *n;
@@ -2997,6 +3074,7 @@ struct hci_dev *hci_alloc_dev(void)
 	INIT_LIST_HEAD(&hdev->identity_resolving_keys);
 	INIT_LIST_HEAD(&hdev->remote_oob_data);
 	INIT_LIST_HEAD(&hdev->le_white_list);
+	INIT_LIST_HEAD(&hdev->le_resolv_list);
 	INIT_LIST_HEAD(&hdev->le_conn_params);
 	INIT_LIST_HEAD(&hdev->pend_le_conns);
 	INIT_LIST_HEAD(&hdev->pend_le_reports);
@@ -3199,6 +3277,7 @@ void hci_unregister_dev(struct hci_dev *hdev)
 	hci_remote_oob_data_clear(hdev);
 	hci_adv_instances_clear(hdev);
 	hci_bdaddr_list_clear(&hdev->le_white_list);
+	hci_bdaddr_list_clear(&hdev->le_resolv_list);
 	hci_conn_params_clear_all(hdev);
 	hci_discovery_filter_clear(hdev);
 	hci_dev_unlock(hdev);

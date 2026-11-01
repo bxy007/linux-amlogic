@@ -214,6 +214,7 @@ enum {
 	HCI_MGMT_DEV_CLASS_EVENTS,
 	HCI_MGMT_LOCAL_NAME_EVENTS,
 	HCI_MGMT_OOB_DATA_EVENTS,
+	HCI_MGMT_EXP_FEATURE_EVENTS,
 };
 
 /*
@@ -260,6 +261,8 @@ enum {
 	HCI_VENDOR_DIAG,
 	HCI_FORCE_BREDR_SMP,
 	HCI_FORCE_STATIC_ADDR,
+	HCI_ENABLE_LL_PRIVACY,
+	HCI_LL_RPA_RESOLUTION,
 
 	__HCI_NUM_FLAGS,
 };
@@ -398,6 +401,7 @@ enum {
 #define HCI_LE_SLAVE_FEATURES		0x08
 #define HCI_LE_PING			0x10
 #define HCI_LE_DATA_LEN_EXT		0x20
+#define HCI_LE_LL_PRIVACY		0x40
 #define HCI_LE_EXT_SCAN_POLICY		0x80
 
 /* Connection modes */
@@ -463,6 +467,7 @@ enum {
 #define HCI_ERROR_INVALID_LL_PARAMS	0x1e
 #define HCI_ERROR_UNSPECIFIED		0x1f
 #define HCI_ERROR_ADVERTISING_TIMEOUT	0x3c
+#define HCI_ERROR_CONN_FAILED_TO_ESTABLISH	0x3e
 
 /* Flow control modes */
 #define HCI_FLOW_CTL_MODE_PACKET_BASED	0x00
@@ -1489,6 +1494,39 @@ struct hci_cp_le_write_def_data_len {
 	__le16	tx_time;
 } __packed;
 
+#define HCI_OP_LE_ADD_TO_RESOLV_LIST	0x2027
+struct hci_cp_le_add_to_resolv_list {
+	__u8	 bdaddr_type;
+	bdaddr_t bdaddr;
+	__u8	 peer_irk[16];
+	__u8	 local_irk[16];
+} __packed;
+
+#define HCI_OP_LE_DEL_FROM_RESOLV_LIST	0x2028
+struct hci_cp_le_del_from_resolv_list {
+	__u8	 bdaddr_type;
+	bdaddr_t bdaddr;
+} __packed;
+
+#define HCI_OP_LE_CLEAR_RESOLV_LIST	0x2029
+
+#define HCI_OP_LE_READ_RESOLV_LIST_SIZE	0x202a
+struct hci_rp_le_read_resolv_list_size {
+	__u8	status;
+	__u8	size;
+} __packed;
+
+#define HCI_OP_LE_SET_ADDR_RESOLV_ENABLE 0x202d
+
+#define HCI_OP_LE_SET_RPA_TIMEOUT	0x202e
+
+#define HCI_OP_LE_SET_PRIVACY_MODE	0x204e
+struct hci_cp_le_set_privacy_mode {
+	__u8 bdaddr_type;
+	bdaddr_t bdaddr;
+	__u8 mode;
+} __packed;
+
 #define HCI_OP_LE_READ_MAX_DATA_LEN	0x202f
 struct hci_rp_le_read_max_data_len {
 	__u8	status;
@@ -1888,6 +1926,8 @@ struct hci_ev_le_conn_complete {
 
 #define ADDR_LE_DEV_PUBLIC	0x00
 #define ADDR_LE_DEV_RANDOM	0x01
+#define ADDR_LE_DEV_PUBLIC_RESOLVED	0x02
+#define ADDR_LE_DEV_RANDOM_RESOLVED	0x03
 
 #define HCI_EV_LE_ADVERTISING_REPORT	0x02
 struct hci_ev_le_advertising_info {
@@ -1937,6 +1977,21 @@ struct hci_ev_le_data_len_change {
 	__le16	tx_time;
 	__le16	rx_len;
 	__le16	rx_time;
+} __packed;
+
+#define HCI_EV_LE_ENHANCED_CONN_COMPLETE    0x0a
+struct hci_ev_le_enh_conn_complete {
+	__u8      status;
+	__le16    handle;
+	__u8      role;
+	__u8      bdaddr_type;
+	bdaddr_t  bdaddr;
+	bdaddr_t  local_rpa;
+	bdaddr_t  peer_rpa;
+	__le16    interval;
+	__le16    latency;
+	__le16    supervision_timeout;
+	__u8      clk_accurancy;
 } __packed;
 
 #define HCI_EV_LE_DIRECT_ADV_REPORT	0x0B

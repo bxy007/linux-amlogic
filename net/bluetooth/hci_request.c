@@ -434,7 +434,7 @@ static void __hci_update_background_scan(struct hci_request *req)
 		if (!hci_dev_test_flag(hdev, HCI_LE_SCAN))
 			return;
 
-		hci_req_add_le_scan_disable(req);
+		hci_req_add_le_scan_disable(req, false);
 
 		BT_DBG("%s stopping background scanning", hdev->name);
 	} else {
@@ -453,7 +453,7 @@ static void __hci_update_background_scan(struct hci_request *req)
 		 * don't miss any advertising (due to duplicates filter).
 		 */
 		if (hci_dev_test_flag(hdev, HCI_LE_SCAN))
-			hci_req_add_le_scan_disable(req);
+			hci_req_add_le_scan_disable(req, false);
 
 		hci_req_add_le_passive_scan(req);
 
@@ -658,13 +658,120 @@ void __hci_req_update_eir(struct hci_request *req)
 	hci_req_add(req, HCI_OP_WRITE_EIR, sizeof(cp), &cp);
 }
 
-void hci_req_add_le_scan_disable(struct hci_request *req)
+
+/* A scan pause must not turn off address resolution: advertising may still
+ * depend on it. Resolution-list updates have their own serialized pause.
+ */
+void hci_req_add_le_scan_disable(struct hci_request *req, bool pause)
 {
 	struct hci_cp_le_set_scan_enable cp;
+	struct sk_buff *skb;
 
 	memset(&cp, 0, sizeof(cp));
 	cp.enable = LE_SCAN_DISABLE;
 	hci_req_add(req, HCI_OP_LE_SET_SCAN_ENABLE, sizeof(cp), &cp);
+	if (!pause || req->err)
+		return;
+	skb = skb_peek_tail(&req->cmd_q);
+	bt_cb(skb)->hci.req_flags |= HCI_REQ_SCAN_PAUSE;
+}
+
+static bool pending_le_identity(struct hci_dev *hdev, bdaddr_t *addr, u8 type)
+{
+	return hci_pend_le_action_lookup(&hdev->pend_le_conns, addr, type) ||
+	       hci_pend_le_action_lookup(&hdev->pend_le_reports, addr, type);
+}
+
+static void remove_resolving_entry(struct hci_request *req, bdaddr_t *addr,
+				   u8 type)
+{
+	struct hci_cp_le_del_from_resolv_list cp;
+
+	cp.bdaddr_type = type;
+	bacpy(&cp.bdaddr, addr);
+	hci_req_add(req, HCI_OP_LE_DEL_FROM_RESOLV_LIST, sizeof(cp), &cp);
+}
+
+static void set_peer_privacy_mode(struct hci_request *req,
+				  struct hci_conn_params *params,
+				  struct bdaddr_list_with_irk *entry)
+{
+	struct hci_cp_le_set_privacy_mode cp;
+
+	if (!(req->hdev->commands[39] & 0x04))
+		return;
+	cp.mode = !!(params->current_flags & HCI_CONN_FLAG_DEVICE_PRIVACY);
+	/* New resolving-list entries default to Network Privacy Mode. */
+	if ((!entry && !cp.mode) || (entry && entry->privacy_mode == cp.mode))
+		return;
+	cp.bdaddr_type = params->addr_type;
+	bacpy(&cp.bdaddr, &params->addr);
+	hci_req_add(req, HCI_OP_LE_SET_PRIVACY_MODE, sizeof(cp), &cp);
+}
+
+static void add_resolving_entry(struct hci_request *req,
+				struct hci_conn_params *params)
+{
+	struct hci_dev *hdev = req->hdev;
+	struct hci_cp_le_add_to_resolv_list cp;
+	struct bdaddr_list_with_irk *entry;
+	struct smp_irk *irk;
+
+	irk = hci_find_irk_by_addr(hdev, &params->addr, params->addr_type);
+	if (!irk)
+		return;
+	memset(&cp, 0, sizeof(cp));
+	cp.bdaddr_type = params->addr_type;
+	bacpy(&cp.bdaddr, &params->addr);
+	memcpy(cp.peer_irk, irk->val, sizeof(cp.peer_irk));
+	if (hci_dev_test_flag(hdev, HCI_PRIVACY))
+		memcpy(cp.local_irk, hdev->irk, sizeof(cp.local_irk));
+	entry = hci_bdaddr_list_lookup_with_irk(&hdev->le_resolv_list,
+					       &params->addr, params->addr_type);
+	/* Re-pairing can change the IRK without changing the identity address.
+	 * Never retain the old controller key just because its address matches.
+	 */
+	if (entry && (memcmp(entry->peer_irk, cp.peer_irk, 16) ||
+		      memcmp(entry->local_irk, cp.local_irk, 16))) {
+		remove_resolving_entry(req, &entry->bdaddr, entry->bdaddr_type);
+		entry = NULL;
+	}
+	if (!entry)
+		hci_req_add(req, HCI_OP_LE_ADD_TO_RESOLV_LIST, sizeof(cp), &cp);
+	set_peer_privacy_mode(req, params, entry);
+}
+
+/* The request is built with hdev locked, after scan/address resolution has
+ * been disabled. Preflight the entire pending set: list overflow must not
+ * cause a partially programmed filter to hide other paired peripherals.
+ */
+static bool update_resolving_list(struct hci_request *req)
+{
+	struct hci_dev *hdev = req->hdev;
+	struct bdaddr_list_with_irk *entry;
+	struct hci_conn_params *params;
+	unsigned int count = 0;
+
+	if (!hci_ll_privacy_enabled(hdev))
+		return false;
+	list_for_each_entry(params, &hdev->pend_le_conns, action)
+		if (hci_find_irk_by_addr(hdev, &params->addr, params->addr_type))
+			count++;
+	list_for_each_entry(params, &hdev->pend_le_reports, action)
+		if (hci_find_irk_by_addr(hdev, &params->addr, params->addr_type))
+			count++;
+	if (count > hdev->le_resolv_list_size)
+		return false;
+
+	list_for_each_entry(entry, &hdev->le_resolv_list, list)
+		if (!pending_le_identity(hdev, &entry->bdaddr, entry->bdaddr_type) ||
+		    !hci_find_irk_by_addr(hdev, &entry->bdaddr, entry->bdaddr_type))
+			remove_resolving_entry(req, &entry->bdaddr, entry->bdaddr_type);
+	list_for_each_entry(params, &hdev->pend_le_conns, action)
+		add_resolving_entry(req, params);
+	list_for_each_entry(params, &hdev->pend_le_reports, action)
+		add_resolving_entry(req, params);
+	return true;
 }
 
 static void add_to_white_list(struct hci_request *req,
@@ -678,7 +785,7 @@ static void add_to_white_list(struct hci_request *req,
 	hci_req_add(req, HCI_OP_LE_ADD_TO_WHITE_LIST, sizeof(cp), &cp);
 }
 
-static u8 update_white_list(struct hci_request *req)
+static u8 update_white_list(struct hci_request *req, bool ll_privacy)
 {
 	struct hci_dev *hdev = req->hdev;
 	struct hci_conn_params *params;
@@ -709,7 +816,7 @@ static u8 update_white_list(struct hci_request *req)
 			continue;
 		}
 
-		if (hci_find_irk_by_addr(hdev, &b->bdaddr, b->bdaddr_type)) {
+		if (!ll_privacy && hci_find_irk_by_addr(hdev, &b->bdaddr, b->bdaddr_type)) {
 			/* White list can not be used with RPAs */
 			return 0x00;
 		}
@@ -737,7 +844,7 @@ static u8 update_white_list(struct hci_request *req)
 			return 0x00;
 		}
 
-		if (hci_find_irk_by_addr(hdev, &params->addr,
+		if (!ll_privacy && hci_find_irk_by_addr(hdev, &params->addr,
 					 params->addr_type)) {
 			/* White list can not be used with RPAs */
 			return 0x00;
@@ -761,7 +868,7 @@ static u8 update_white_list(struct hci_request *req)
 			return 0x00;
 		}
 
-		if (hci_find_irk_by_addr(hdev, &params->addr,
+		if (!ll_privacy && hci_find_irk_by_addr(hdev, &params->addr,
 					 params->addr_type)) {
 			/* White list can not be used with RPAs */
 			return 0x00;
@@ -780,13 +887,23 @@ static bool scan_use_rpa(struct hci_dev *hdev)
 	return hci_dev_test_flag(hdev, HCI_PRIVACY);
 }
 
-void hci_req_add_le_passive_scan(struct hci_request *req)
+u8 hci_req_ll_own_addr_type(struct hci_dev *hdev)
+{
+	bdaddr_t identity;
+	u8 type;
+
+	hci_copy_identity_address(hdev, &identity, &type);
+	return type == ADDR_LE_DEV_PUBLIC ? ADDR_LE_DEV_PUBLIC_RESOLVED :
+					 ADDR_LE_DEV_RANDOM_RESOLVED;
+}
+
+static void add_le_passive_scan(struct hci_request *req, bool ll_privacy,
+				u8 filter_policy)
 {
 	struct hci_cp_le_set_scan_param param_cp;
 	struct hci_cp_le_set_scan_enable enable_cp;
 	struct hci_dev *hdev = req->hdev;
 	u8 own_addr_type;
-	u8 filter_policy;
 
 	/* Set require_privacy to false since no SCAN_REQ are send
 	 * during passive scanning. Not using an non-resolvable address
@@ -794,15 +911,12 @@ void hci_req_add_le_passive_scan(struct hci_request *req)
 	 * advertising with our address will be correctly reported
 	 * by the controller.
 	 */
-	if (hci_update_random_address(req, false, scan_use_rpa(hdev),
-				      &own_addr_type))
+	if (ll_privacy && scan_use_rpa(hdev)) {
+		own_addr_type = hci_req_ll_own_addr_type(hdev);
+	} else if (hci_update_random_address(req, false, scan_use_rpa(hdev),
+					     &own_addr_type)) {
 		return;
-
-	/* Adding or removing entries from the white list must
-	 * happen before enabling scanning. The controller does
-	 * not allow white list modification while scanning.
-	 */
-	filter_policy = update_white_list(req);
+	}
 
 	/* When the controller is using random resolvable addresses and
 	 * with that having LE privacy enabled, then controllers with
@@ -831,6 +945,11 @@ void hci_req_add_le_passive_scan(struct hci_request *req)
 	enable_cp.filter_dup = LE_SCAN_FILTER_DUP_ENABLE;
 	hci_req_add(req, HCI_OP_LE_SET_SCAN_ENABLE, sizeof(enable_cp),
 		    &enable_cp);
+}
+
+void hci_req_add_le_passive_scan(struct hci_request *req)
+{
+	add_le_passive_scan(req, false, update_white_list(req, false));
 }
 
 static u8 get_cur_adv_instance_scan_rsp_len(struct hci_dev *hdev)
@@ -916,61 +1035,101 @@ static bool adv_use_rpa(struct hci_dev *hdev, uint32_t flags)
 	return true;
 }
 
+
+/* Follow the controller's LE Supported States, rather than rejecting all
+ * advertising whenever a central/peripheral connection exists.
+ */
+bool hci_req_advertising_allowed(struct hci_dev *hdev, bool connectable)
+{
+	if (!hci_conn_num(hdev, LE_LINK))
+		return true;
+	if (hdev->conn_hash.le_num_slave) {
+		if (!connectable && !(hdev->le_states[2] & 0x10))
+			return false;
+		if (connectable && (!(hdev->le_states[4] & 0x40) ||
+				    !(hdev->le_states[2] & 0x20)))
+			return false;
+	}
+	if (hci_conn_num(hdev, LE_LINK) != hdev->conn_hash.le_num_slave) {
+		if (!connectable && !(hdev->le_states[2] & 0x02))
+			return false;
+		if (connectable && (!(hdev->le_states[4] & 0x08) ||
+				    !(hdev->le_states[2] & 0x08)))
+			return false;
+	}
+	return true;
+}
+
+/* Later commands in the same asynchronous request must see queued disables,
+ * without changing global flags before the controller acknowledges them.
+ */
+static bool le_req_enabled(struct hci_request *req, u16 opcode, int flag)
+{
+	struct sk_buff *skb;
+	bool enabled = hci_dev_test_flag(req->hdev, flag);
+
+	skb_queue_walk(&req->cmd_q, skb) {
+		if (hci_skb_opcode(skb) == opcode && skb->len > HCI_COMMAND_HDR_SIZE)
+			enabled = !!skb->data[HCI_COMMAND_HDR_SIZE];
+	}
+	return enabled;
+}
 void __hci_req_enable_advertising(struct hci_request *req)
 {
 	struct hci_dev *hdev = req->hdev;
 	struct hci_cp_le_set_adv_param cp;
+	struct hci_cp_le_set_scan_enable scan_cp;
 	u8 own_addr_type, enable = 0x01;
-	bool connectable;
+	bool connectable, restart_scan;
 	u32 flags;
-
-	if (hci_conn_num(hdev, LE_LINK) > 0)
-		return;
-
-	if (hci_dev_test_flag(hdev, HCI_LE_ADV))
-		__hci_req_disable_advertising(req);
-
-	/* Clear the HCI_LE_ADV bit temporarily so that the
-	 * hci_update_random_address knows that it's safe to go ahead
-	 * and write a new random address. The flag will be set back on
-	 * as soon as the SET_ADV_ENABLE HCI command completes.
-	 */
-	hci_dev_clear_flag(hdev, HCI_LE_ADV);
+	int err;
 
 	flags = get_adv_instance_flags(hdev, hdev->cur_adv_instance);
-
-	/* If the "connectable" instance flag was not set, then choose between
-	 * ADV_IND and ADV_NONCONN_IND based on the global connectable setting.
-	 */
 	connectable = (flags & MGMT_ADV_FLAG_CONNECTABLE) ||
 		      mgmt_get_connectable(hdev);
-
-	/* Set require_privacy to true only when non-connectable
-	 * advertising is used. In that case it is fine to use a
-	 * non-resolvable private address.
-	 */
-	if (hci_update_random_address(req, !connectable,
-				      adv_use_rpa(hdev, flags),
-				      &own_addr_type) < 0)
+	if (!hci_req_advertising_allowed(hdev, connectable) ||
+	    hci_lookup_le_connect(hdev))
 		return;
+
+	restart_scan = le_req_enabled(req, HCI_OP_LE_SET_SCAN_ENABLE, HCI_LE_SCAN);
+	/* Discovery owns active scanning and will restore advertising on stop. */
+	if (restart_scan && hdev->le_scan_type == LE_SCAN_ACTIVE)
+		return;
+	if (restart_scan)
+		hci_req_add_le_scan_disable(req, true);
+	if (le_req_enabled(req, HCI_OP_LE_SET_ADV_ENABLE, HCI_LE_ADV))
+		__hci_req_disable_advertising(req);
+
+	/* Advertising uses the host RPA with the same persistent local IRK.
+	 * It does not require stealing a resolving-list slot for a dummy peer.
+	 */
+	err = hci_update_random_address(req, !connectable,
+					adv_use_rpa(hdev, flags), &own_addr_type);
+	if (err < 0) {
+		req->err = err;
+		return;
+	}
 
 	memset(&cp, 0, sizeof(cp));
 	cp.min_interval = cpu_to_le16(hdev->le_adv_min_interval);
 	cp.max_interval = cpu_to_le16(hdev->le_adv_max_interval);
-
 	if (connectable)
 		cp.type = LE_ADV_IND;
 	else if (get_cur_adv_instance_scan_rsp_len(hdev))
 		cp.type = LE_ADV_SCAN_IND;
 	else
 		cp.type = LE_ADV_NONCONN_IND;
-
 	cp.own_address_type = own_addr_type;
 	cp.channel_map = hdev->le_adv_channel_map;
-
 	hci_req_add(req, HCI_OP_LE_SET_ADV_PARAM, sizeof(cp), &cp);
-
 	hci_req_add(req, HCI_OP_LE_SET_ADV_ENABLE, sizeof(enable), &enable);
+
+	if (restart_scan) {
+		memset(&scan_cp, 0, sizeof(scan_cp));
+		scan_cp.enable = LE_SCAN_ENABLE;
+		scan_cp.filter_dup = LE_SCAN_FILTER_DUP_ENABLE;
+		hci_req_add(req, HCI_OP_LE_SET_SCAN_ENABLE, sizeof(scan_cp), &scan_cp);
+	}
 }
 
 u8 append_local_name(struct hci_dev *hdev, u8 *ptr, u8 ad_len)
@@ -1204,6 +1363,12 @@ void hci_req_reenable_advertising(struct hci_dev *hdev)
 {
 	struct hci_request req;
 
+	/* Serialize implicit restores with resolving-list transactions. */
+	if (hci_ll_privacy_enabled(hdev)) {
+		hci_update_background_scan(hdev);
+		return;
+	}
+
 	if (!hci_dev_test_flag(hdev, HCI_ADVERTISING) &&
 	    list_empty(&hdev->adv_instances))
 		return;
@@ -1401,7 +1566,8 @@ static void set_random_addr(struct hci_request *req, bdaddr_t *rpa)
 	 * In this kind of scenario skip the update and let the random
 	 * address be updated at the next cycle.
 	 */
-	if (hci_dev_test_flag(hdev, HCI_LE_ADV) ||
+	if (le_req_enabled(req, HCI_OP_LE_SET_ADV_ENABLE, HCI_LE_ADV) ||
+	    le_req_enabled(req, HCI_OP_LE_SET_SCAN_ENABLE, HCI_LE_SCAN) ||
 	    hci_lookup_le_connect(hdev)) {
 		BT_DBG("Deferring random address update");
 		hci_dev_set_flag(hdev, HCI_RPA_EXPIRED);
@@ -1582,7 +1748,7 @@ static int connectable_update(struct hci_request *req, unsigned long opt)
 	    !list_empty(&hdev->adv_instances))
 		__hci_req_enable_advertising(req);
 
-	__hci_update_background_scan(req);
+	hci_update_background_scan(hdev);
 
 	hci_dev_unlock(hdev);
 
@@ -1809,6 +1975,190 @@ static int update_bg_scan(struct hci_request *req, unsigned long opt)
 	return 0;
 }
 
+/* Adapt the mainline pause/update/resume transaction to 4.9's request API.
+ * Each stage waits for controller completion without holding hdev->lock.
+ * A failed batch must not discard the only commands restoring advertising.
+ */
+enum privacy_scan_step {
+	PRIVACY_SYNC_STATE,
+	PRIVACY_STOP_SCAN,
+	PRIVACY_PAUSE_ADV,
+	PRIVACY_DISABLE_RESOLUTION,
+	PRIVACY_UPDATE_LISTS,
+	PRIVACY_ENABLE_RESOLUTION,
+	PRIVACY_RESTORE_ADV,
+	PRIVACY_START_SCAN,
+};
+
+struct privacy_scan_update {
+	enum privacy_scan_step step;
+	bool ll_privacy;
+	u8 filter_policy;
+};
+
+static bool background_scan_allowed(struct hci_dev *hdev)
+{
+	return test_bit(HCI_UP, &hdev->flags) &&
+	       !test_bit(HCI_INIT, &hdev->flags) &&
+	       !hci_dev_test_flag(hdev, HCI_SETUP) &&
+	       !hci_dev_test_flag(hdev, HCI_CONFIG) &&
+	       !hci_dev_test_flag(hdev, HCI_AUTO_OFF) &&
+	       !hci_dev_test_flag(hdev, HCI_UNREGISTER) &&
+	       hci_dev_test_flag(hdev, HCI_LE_ENABLED) &&
+	       hdev->discovery.state == DISCOVERY_STOPPED &&
+	       !hci_lookup_le_connect(hdev);
+}
+
+static int privacy_scan_stage(struct hci_request *req, unsigned long opt)
+{
+	struct hci_dev *hdev = req->hdev;
+	struct privacy_scan_update *update = (void *)opt;
+	u8 enable;
+	int err = 0;
+
+	hci_dev_lock(hdev);
+	/* An explicit connection/discovery request may have acquired the
+	 * controller between stages. It owns the radio until it completes.
+	 */
+	if (!background_scan_allowed(hdev)) {
+		err = -EBUSY;
+		goto unlock;
+	}
+
+	switch (update->step) {
+	case PRIVACY_SYNC_STATE:
+		/* Fence older asynchronous management requests before reading
+		 * their acknowledged advertising/scanning state in later stages.
+		 */
+		hci_req_add(req, HCI_OP_READ_LOCAL_VERSION, 0, NULL);
+		break;
+	case PRIVACY_STOP_SCAN:
+		if (hci_dev_test_flag(hdev, HCI_LE_SCAN))
+			hci_req_add_le_scan_disable(req, true);
+		break;
+	case PRIVACY_PAUSE_ADV:
+		if (hci_dev_test_flag(hdev, HCI_LE_ADV))
+			__hci_req_disable_advertising(req);
+		break;
+	case PRIVACY_DISABLE_RESOLUTION:
+		if (hci_dev_test_flag(hdev, HCI_LL_RPA_RESOLUTION)) {
+			enable = 0;
+			hci_req_add(req, HCI_OP_LE_SET_ADDR_RESOLV_ENABLE, 1, &enable);
+		}
+		break;
+	case PRIVACY_UPDATE_LISTS:
+		if (hci_dev_test_flag(hdev, HCI_LE_SCAN) ||
+		    hci_dev_test_flag(hdev, HCI_LE_ADV) ||
+		    hci_dev_test_flag(hdev, HCI_LL_RPA_RESOLUTION)) {
+			err = -EBUSY;
+			break;
+		}
+		update->ll_privacy = update_resolving_list(req);
+		update->filter_policy = update_white_list(req, update->ll_privacy);
+		break;
+	case PRIVACY_ENABLE_RESOLUTION:
+		if (update->ll_privacy) {
+			enable = 1;
+			hci_req_add(req, HCI_OP_LE_SET_ADDR_RESOLV_ENABLE, 1, &enable);
+		}
+		break;
+	case PRIVACY_RESTORE_ADV:
+		if (hci_dev_test_flag(hdev, HCI_LE_ADV))
+			break;
+		if (hci_dev_test_flag(hdev, HCI_ADVERTISING)) {
+			__hci_req_enable_advertising(req);
+		} else if (!list_empty(&hdev->adv_instances)) {
+			struct adv_info *adv;
+
+			adv = hci_find_adv_instance(hdev, hdev->cur_adv_instance);
+			if (!adv)
+				adv = list_first_entry(&hdev->adv_instances,
+						       struct adv_info, list);
+			/* Keep an existing rotation timer: a brief pause must not
+			 * reset instance lifetime or inflate remaining time.
+			 */
+			if (hdev->adv_instance_timeout)
+				__hci_req_enable_advertising(req);
+			else
+				err = __hci_req_schedule_adv_instance(req, adv->instance, true);
+		}
+		break;
+	case PRIVACY_START_SCAN:
+		if (!list_empty(&hdev->pend_le_conns) ||
+		    !list_empty(&hdev->pend_le_reports)) {
+			if (!hci_dev_test_flag(hdev, HCI_LE_SCAN)) {
+				hci_discovery_filter_clear(hdev);
+				add_le_passive_scan(req, update->ll_privacy,
+						    update->filter_policy);
+			}
+		}
+		break;
+	}
+
+unlock:
+	hci_dev_unlock(hdev);
+	return err;
+}
+
+static int run_privacy_scan_stage(struct hci_dev *hdev,
+				 struct privacy_scan_update *update,
+				 enum privacy_scan_step step)
+{
+	update->step = step;
+	return __hci_req_sync(hdev, privacy_scan_stage, (unsigned long)update,
+			      HCI_CMD_TIMEOUT, NULL);
+}
+
+static int update_privacy_scan(struct hci_dev *hdev)
+{
+	struct privacy_scan_update update = { 0 };
+	int err, restore_err, scan_err;
+
+	hci_req_sync_lock(hdev);
+	err = run_privacy_scan_stage(hdev, &update, PRIVACY_SYNC_STATE);
+	if (err)
+		goto restore;
+	err = run_privacy_scan_stage(hdev, &update, PRIVACY_STOP_SCAN);
+	if (err)
+		goto restore;
+	err = run_privacy_scan_stage(hdev, &update, PRIVACY_PAUSE_ADV);
+	if (err)
+		goto restore;
+	err = run_privacy_scan_stage(hdev, &update, PRIVACY_DISABLE_RESOLUTION);
+	if (err)
+		goto restore;
+	err = run_privacy_scan_stage(hdev, &update, PRIVACY_UPDATE_LISTS);
+	if (err)
+		goto restore;
+	err = run_privacy_scan_stage(hdev, &update, PRIVACY_ENABLE_RESOLUTION);
+
+restore:
+	if (err) {
+		/* Unfiltered software scanning is safe even if a partial list
+		 * remains in hardware. Do not expose a partially updated filter.
+		 */
+		update.ll_privacy = false;
+		update.filter_policy = 0;
+		if (err != -EBUSY)
+			BT_ERR("%s privacy-list update failed (%d), using software scan",
+			       hdev->name, err);
+	}
+	/* Independent requests run even if a previous batch was purged. */
+	restore_err = run_privacy_scan_stage(hdev, &update, PRIVACY_RESTORE_ADV);
+	if (restore_err && restore_err != -EBUSY)
+		restore_err = run_privacy_scan_stage(hdev, &update, PRIVACY_RESTORE_ADV);
+	scan_err = run_privacy_scan_stage(hdev, &update, PRIVACY_START_SCAN);
+	if (scan_err && scan_err != -EBUSY)
+		scan_err = run_privacy_scan_stage(hdev, &update, PRIVACY_START_SCAN);
+	hci_req_sync_unlock(hdev);
+
+	if (restore_err && restore_err != -EBUSY)
+		BT_ERR("%s failed to restore advertising (%d)", hdev->name, restore_err);
+	if (scan_err && scan_err != -EBUSY)
+		BT_ERR("%s failed to restore scanning (%d)", hdev->name, scan_err);
+	return err ?: restore_err ?: scan_err;
+}
+
 static void bg_scan_update(struct work_struct *work)
 {
 	struct hci_dev *hdev = container_of(work, struct hci_dev,
@@ -1816,6 +2166,11 @@ static void bg_scan_update(struct work_struct *work)
 	struct hci_conn *conn;
 	u8 status;
 	int err;
+
+	if (hci_ll_privacy_enabled(hdev)) {
+		update_privacy_scan(hdev);
+		return;
+	}
 
 	err = hci_req_sync(hdev, update_bg_scan, 0, HCI_CMD_TIMEOUT, &status);
 	if (!err)
@@ -1832,7 +2187,7 @@ static void bg_scan_update(struct work_struct *work)
 
 static int le_scan_disable(struct hci_request *req, unsigned long opt)
 {
-	hci_req_add_le_scan_disable(req);
+	hci_req_add_le_scan_disable(req, false);
 	return 0;
 }
 
@@ -1930,7 +2285,7 @@ static int le_scan_restart(struct hci_request *req, unsigned long opt)
 	if (!hci_dev_test_flag(hdev, HCI_LE_SCAN))
 		return 0;
 
-	hci_req_add_le_scan_disable(req);
+	hci_req_add_le_scan_disable(req, true);
 
 	memset(&cp, 0, sizeof(cp));
 	cp.enable = LE_SCAN_ENABLE;
@@ -2029,7 +2384,7 @@ static int active_scan(struct hci_request *req, unsigned long opt)
 	 * discovery scanning parameters.
 	 */
 	if (hci_dev_test_flag(hdev, HCI_LE_SCAN))
-		hci_req_add_le_scan_disable(req);
+		hci_req_add_le_scan_disable(req, false);
 
 	/* All active scans will be done with either a resolvable private
 	 * address (when privacy feature has been enabled) or non-resolvable
@@ -2157,14 +2512,14 @@ bool hci_req_stop_discovery(struct hci_request *req)
 
 		if (hci_dev_test_flag(hdev, HCI_LE_SCAN)) {
 			cancel_delayed_work(&hdev->le_scan_disable);
-			hci_req_add_le_scan_disable(req);
+			hci_req_add_le_scan_disable(req, false);
 		}
 
 		ret = true;
 	} else {
 		/* Passive scanning */
 		if (hci_dev_test_flag(hdev, HCI_LE_SCAN)) {
-			hci_req_add_le_scan_disable(req);
+			hci_req_add_le_scan_disable(req, false);
 			ret = true;
 		}
 	}

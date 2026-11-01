@@ -63,9 +63,12 @@ void __hci_req_write_fast_connectable(struct hci_request *req, bool enable);
 void __hci_req_update_name(struct hci_request *req);
 void __hci_req_update_eir(struct hci_request *req);
 
-void hci_req_add_le_scan_disable(struct hci_request *req);
+void hci_req_add_le_scan_disable(struct hci_request *req,
+				 bool pause);
 void hci_req_add_le_passive_scan(struct hci_request *req);
+u8 hci_req_ll_own_addr_type(struct hci_dev *hdev);
 
+bool hci_req_advertising_allowed(struct hci_dev *hdev, bool connectable);
 void hci_req_reenable_advertising(struct hci_dev *hdev);
 void __hci_req_enable_advertising(struct hci_request *req);
 void __hci_req_disable_advertising(struct hci_request *req);
