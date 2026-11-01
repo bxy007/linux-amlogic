@@ -285,6 +285,7 @@ static s32 alloc_local_dma_buf(struct device *dev,
 		aucpu_pr(LOG_ERROR, "error dma mapping addr 0x%lx\n",
 			 (ulong)dma_addr);
 		kfree((void *)buf->base);
+		buf->base = 0;
 		buf->size = 0;
 		return -EINVAL;
 	}
@@ -652,7 +653,7 @@ unsigned long sec_fw_cmd(u32 type, void *fw, size_t size)
 	return smccc.a0;
 }
 
-static int load_start_aucpu_fw(struct device *device)
+static int load_start_aucpu_fw(struct device *device, bool *start_attempted)
 {
 	const struct firmware *my_fw = NULL;
 	char *fw;
@@ -662,11 +663,17 @@ static int load_start_aucpu_fw(struct device *device)
 
 	aucpu_pr(LOG_DEBUG, "FW\n");
 
-	request_firmware(&my_fw, "aucpu_fw.bin", device);
-	if (!my_fw) {
+	result = request_firmware(&my_fw, "aucpu_fw.bin", device);
+	if (result) {
 		aucpu_pr(LOG_ERROR, "load aucpu_fw.bin fail\n");
-		result = AUCPU_ERROR_NOT_IMPLEMENTED;
 		return result;
+	}
+
+	/* Bound the secure shared-memory copy and the four-byte log read. */
+	if (my_fw->size < 4 || my_fw->size > AUCPU_MAX_FW_SZ) {
+		dev_err(device, "invalid AUCPU firmware size %zu\n", my_fw->size);
+		release_firmware(my_fw);
+		return -EINVAL;
 	}
 
 	fw = (char *)my_fw->data;
@@ -675,9 +682,16 @@ static int load_start_aucpu_fw(struct device *device)
 	aucpu_pr(LOG_INFO, "FW read size %d data 0x%x-%x-%x-%x\n", length,
 		 fw[0], fw[1], fw[2], fw[3]);
 
+	/* Even a failed secure call does not prove the processor is stopped. */
+	*start_attempted = true;
 	result = sec_fw_cmd(FW_TYPE_AUCPU, fw, length);
 
 	release_firmware(my_fw);
+
+	if (result) {
+		dev_err(device, "AUCPU secure firmware load failed: %d\n", result);
+		return -EIO;
+	}
 
 	aucpu_pr(LOG_INFO, "download fw success reset start AUCPU\n");
 	aucpu_pr(LOG_INFO, "[%s] done  result %d\n", __func__, result);
@@ -1229,6 +1243,7 @@ static s32 aucpu_mem_device_init(struct reserved_mem *rmem,
 static s32 aucpu_probe(struct platform_device *pdev)
 {
 	s32 err = 0, irq, reg_count, idx;
+	bool fw_start_attempted = false;
 	struct resource res;
 	struct device_node *np, *child;
 	struct aucpu_ctx_t *pctx;
@@ -1330,9 +1345,11 @@ static s32 aucpu_probe(struct platform_device *pdev)
 		goto ERROR_PROVE_DEVICE;
 	}
 	/* load FW and start AUCPU */
-	load_firmware_status = load_start_aucpu_fw(&pdev->dev /*aucpu_dev */);
+	load_firmware_status = load_start_aucpu_fw(&pdev->dev,
+						 &fw_start_attempted);
 	if (load_firmware_status) {
 		aucpu_pr(LOG_ERROR, "load start_aucpu_fw fail\n");
+		err = load_firmware_status;
 		goto ERROR_PROVE_DEVICE;
 	}
 	aucpu_pr(LOG_INFO, "aucpu fw version: 0x%x\n",
@@ -1371,6 +1388,14 @@ ERROR_PROVE_DEVICE:
 	if (s_aucpu_register_base)
 		iounmap((void *)s_aucpu_register_base);
 
+	/* The secure stop ABI is not guaranteed on every platform. Do not
+	 * recycle DMA memory after a start attempt without proving quiescence.
+	 */
+	if (!fw_start_attempted)
+		uninit_Aucpu_local_buf(&pdev->dev);
+	else
+		dev_warn(&pdev->dev,
+			 "AUCPU may still be running; retaining DMA buffers\n");
 	uninit_Aucpu_device();
 	aucpu_dev = NULL;
 	kfree(s_aucpu_ctx);
