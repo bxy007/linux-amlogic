@@ -270,15 +270,11 @@ static const struct snd_soc_dapm_widget T9015_audio_dapm_widgets_V2[] = {
 	SND_SOC_DAPM_OUTPUT("Lineout right N"),
 	SND_SOC_DAPM_OUTPUT("Lineout right P"),
 
-	/*DAC playback stream */
-	/*
-	SND_SOC_DAPM_DAC("Left DAC", "HIFI Playback",
-			 AUDIO_CONFIG_BLOCK_ENABLE,
-			 DACL_EN, 0),
-	SND_SOC_DAPM_DAC("Right DAC", "HIFI Playback",
-			 AUDIO_CONFIG_BLOCK_ENABLE,
-			 DACR_EN, 0),
-	*/
+	/* V2 enables the DACs in codec init/bias handling. Keep the stream
+	 * widgets for DAPM routing without changing those power bits.
+	 */
+	SND_SOC_DAPM_DAC("Left DAC", "HIFI Playback", SND_SOC_NOPM, 0, 0),
+	SND_SOC_DAPM_DAC("Right DAC", "HIFI Playback", SND_SOC_NOPM, 0, 0),
 
 	/*DRV output */
 	SND_SOC_DAPM_OUT_DRV("LOLP_OUT_EN", SND_SOC_NOPM,

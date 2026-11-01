@@ -16,6 +16,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/amlogic/clk_measure.h>
 #include <linux/device.h>
 #include <linux/gpio.h>
 #include <linux/module.h>
@@ -1025,7 +1026,44 @@ static int card_resume_post(struct snd_soc_card *card)
 
 }
 
+/* This measures a SoC-wide clock, so expose it once per sound card. */
+static int tdmin_clk_get(struct snd_kcontrol *kcontrol,
+			struct snd_ctl_elem_value *ucontrol)
+{
+	int clk;
+	int value;
+
+	clk = meson_clk_measure(70);
+	if (clk >= 11000000)
+		value = 3;
+	else if (clk >= 6000000)
+		value = 2;
+	else if (clk >= 2000000)
+		value = 1;
+	else
+		value = 0;
+
+
+	ucontrol->value.integer.value[0] = value;
+
+	return 0;
+}
+
+/* current sample mode and its sample rate */
+static const char *const i2sin_clk[] = {
+	"0",
+	"3000000",
+	"6000000",
+	"12000000"
+};
+
+static const struct soc_enum i2sin_clk_enum[] = {
+	SOC_ENUM_SINGLE(SND_SOC_NOPM, 0, ARRAY_SIZE(i2sin_clk),
+			i2sin_clk),
+};
+
 static const struct snd_kcontrol_new snd_controls[] = {
+	SOC_ENUM_EXT("I2SIn CLK", i2sin_clk_enum, tdmin_clk_get, NULL),
 	SOC_SINGLE_BOOL_EXT("Audio Debug",
 			    0,
 			    audio_debug_get,
