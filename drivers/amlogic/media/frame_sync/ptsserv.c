@@ -1412,9 +1412,10 @@ int pts_get_rec_num_bounded(u8 type, u32 val, int max)
 	ulong flags;
 	struct pts_table_s *ptable;
 	struct pts_rec_s *p;
+	bool newest = true;
 	int r = 0;
 
-	if (type >= PTS_TYPE_MAX)
+	if (type >= PTS_TYPE_MAX || max <= 0)
 		return 0;
 
 	ptable = &pts_table[type];
@@ -1424,28 +1425,22 @@ int pts_get_rec_num_bounded(u8 type, u32 val, int max)
 	if (ptable->status != PTS_RUNNING)
 		goto out;
 
-	if (list_empty(&ptable->valid_list))
-		goto out;
-
-	if (ptable->pts_search == &ptable->valid_list) {
-		p = list_entry(ptable->valid_list.next,
-			       struct pts_rec_s, list);
-	} else {
-		p = list_entry(ptable->pts_search, struct pts_rec_s,
-			       list);
-	}
-
-	if (OFFSET_LATER(val, p->offset)) {
-		list_for_each_entry_continue(p, &ptable->valid_list,
-					     list) {
-			if (OFFSET_LATER(p->offset, val))
-				break;
+	/* Aux-carried timestamps can bypass lookup and leave pts_search at an
+	 * old record.  Once that record is more than 2 GiB behind val, signed
+	 * offset ordering would count consumed records as buffered pictures.
+	 * Start at the newest check-in instead: queued offsets are within the
+	 * stream buffer's range, including across the u32 counter wrap.
+	 * The newest PTS may be checked in before its payload is written; do
+	 * not use that unfinished access unit to satisfy the lookahead.
+	 */
+	list_for_each_entry_reverse(p, &ptable->valid_list, list) {
+		if (!OFFSET_LATER(p->offset, val))
+			break;
+		if (newest) {
+			newest = false;
+			continue;
 		}
-	}
-
-	list_for_each_entry_continue(p, &ptable->valid_list, list) {
-		r++;
-		if (r >= max)
+		if (++r >= max)
 			break;
 	}
 
