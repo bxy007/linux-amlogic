@@ -412,6 +412,17 @@ static int h5_rx_3wire_hdr(struct hci_uart *hu, unsigned char c)
 		return 0;
 	}
 
+	if (h5->state != H5_ACTIVE &&
+	    H5_HDR_PKT_TYPE(hdr) != HCI_3WIRE_LINK_PKT) {
+		/* Firmware-loader handoff can leave old HCI events queued.
+		 * Discard them before sequence handling: an inactive link
+		 * must not acknowledge packets from the previous session.
+		 */
+		BT_ERR("Non-link packet received in non-active state");
+		h5_reset_rx(h5);
+		return 0;
+	}
+
 	if (H5_HDR_RELIABLE(hdr) && H5_HDR_SEQ(hdr) != h5->tx_ack) {
 		BT_ERR("Out-of-order packet arrived (%u != %u)",
 		       H5_HDR_SEQ(hdr), h5->tx_ack);
@@ -422,13 +433,6 @@ static int h5_rx_3wire_hdr(struct hci_uart *hu, unsigned char c)
 		 */
 		set_bit(H5_TX_ACK_REQ, &h5->flags);
 		hci_uart_tx_wakeup(hu);
-		h5_reset_rx(h5);
-		return 0;
-	}
-
-	if (h5->state != H5_ACTIVE &&
-	    H5_HDR_PKT_TYPE(hdr) != HCI_3WIRE_LINK_PKT) {
-		BT_ERR("Non-link packet received in non-active state");
 		h5_reset_rx(h5);
 		return 0;
 	}
