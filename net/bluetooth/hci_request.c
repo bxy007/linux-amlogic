@@ -889,12 +889,10 @@ static bool scan_use_rpa(struct hci_dev *hdev)
 
 u8 hci_req_ll_own_addr_type(struct hci_dev *hdev)
 {
-	bdaddr_t identity;
-	u8 type;
-
-	hci_copy_identity_address(hdev, &identity, &type);
-	return type == ADDR_LE_DEV_PUBLIC ? ADDR_LE_DEV_PUBLIC_RESOLVED :
-					 ADDR_LE_DEV_RANDOM_RESOLVED;
+	/* The fallback is the host-generated RPA, not the identity address.
+	 * Match upstream d03c759e3919 even when our identity is public.
+	 */
+	return ADDR_LE_DEV_RANDOM_RESOLVED;
 }
 
 static void add_le_passive_scan(struct hci_request *req, bool ll_privacy,
@@ -911,12 +909,12 @@ static void add_le_passive_scan(struct hci_request *req, bool ll_privacy,
 	 * advertising with our address will be correctly reported
 	 * by the controller.
 	 */
-	if (ll_privacy && scan_use_rpa(hdev)) {
-		own_addr_type = hci_req_ll_own_addr_type(hdev);
-	} else if (hci_update_random_address(req, false, scan_use_rpa(hdev),
-					     &own_addr_type)) {
+	if (hci_update_random_address(req, false, scan_use_rpa(hdev),
+				      &own_addr_type)) {
 		return;
 	}
+	if (ll_privacy && scan_use_rpa(hdev))
+		own_addr_type = hci_req_ll_own_addr_type(hdev);
 
 	/* When the controller is using random resolvable addresses and
 	 * with that having LE privacy enabled, then controllers with

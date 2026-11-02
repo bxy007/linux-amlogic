@@ -30,9 +30,11 @@ pending set exceeds the controller capacity, background scanning uses the
 existing software path without a partially populated address filter.
 
 Enhanced completion uses identity addresses for connection management and
-actual link RPAs for SMP. The public/static-random host identity determines
-the appropriate controller-generated RPA address type. Discovery and existing
-connections continue to use the host stack's normal request ownership.
+actual link RPAs for SMP. Controller privacy uses own-address type 0x03,
+with a host-generated RPA prepared as the fallback, as in d03c759e3919.
+This selection is independent of whether the host identity is public or
+static random: type 0x02 would instead fall back to the public address.
+Discovery and existing connections retain normal request ownership.
 
 Some existing bonds require identity-address initiation. In Device Privacy
 compatibility mode, a genuine establishment failure can alternate the next
