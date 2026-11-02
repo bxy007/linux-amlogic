@@ -6254,16 +6254,15 @@ static int hdmitx_notify_callback_a(struct notifier_block *block,
 	if (audio_param->channel_num != (aud_param->chs - 1))
 	{
 		int ch_num = aud_param->chs;
-		int ch_msk = (1 << (ch_num / 2)) - 1;
 
 		pr_debug(AUD "aout notify channel num: %d\n", ch_num);
 	
 		audio_param->channel_num = (ch_num - 1);
 
-		if ((cmd == CT_PCM) && ch_num && (ch_num % 2 == 0))
-			hdev->aud_output_ch = ((ch_num << 4) & 0xf0) | (ch_msk & 0xf);
-		else
-			hdev->aud_output_ch = 0;
+		/* The audio producer selects SPDIF or I2S and its lane mask via
+		 * hdmitx_ext_set_i2s_mask(). PCM channel count does not identify
+		 * that transport: stereo PCM may also arrive through SPDIF.
+		 */
 		
 		hdev->audio_param_update_flag = 1;
 	}

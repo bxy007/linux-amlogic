@@ -75,6 +75,8 @@ static int sharebuffer_spdifout_prepare(struct snd_pcm_substream *substream,
 	aud_param.chs = 2;
 
 	/* notify hdmitx audio */
+	/* Same-source PCM uses SPDIF, including after an I2S stream. */
+	hdmitx_ext_set_i2s_mask(0, 0);
 	aout_notifier_call_chain(AOUT_EVENT_IEC_60958_PCM, &aud_param);
 
 	return 0;
