@@ -193,7 +193,7 @@ static uint dolby_vision_status;
 module_param(dolby_vision_status, uint, 0664);
 MODULE_PARM_DESC(dolby_vision_status, "\n dolby_vision_status\n");
 
-static u32 dv_new_blob_max_hz = 50;
+static u32 dv_new_blob_max_hz = 60;
 module_param(dv_new_blob_max_hz, uint, 0664);
 MODULE_PARM_DESC(dv_new_blob_max_hz, "\n dv_new_blob_max_hz\n");
 
