@@ -67,6 +67,7 @@
 #include <linux/amlogic/media/vout/lcd/lcd_notify.h>
 #include <linux/amlogic/media/vout/hdmi_tx/hdmi_tx_module.h>
 #include "../../common/vfm/vfm.h"
+#include "dv_hdr10_encoding.h"
 
 DEFINE_SPINLOCK(dovi_lock);
 
@@ -1966,6 +1967,209 @@ static int dolby_core2_set
   return 0;
 }
 
+/* Default-off optical diagnostic: proportional linear RGB from the first LMS
+ * component. Submit through the normal Core3 path instead of raw MMIO writes.
+ */
+static bool dv_core3_test_rgb;
+static unsigned int dv_core3_test_rgb_values[3] = {16384, 16384, 16384};
+
+static int dv_core3_test_rgb_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(val, kp);
+
+	if (!ret)
+		dolby_vision_set_toggle_flag(1);
+	return ret;
+}
+
+static const struct kernel_param_ops dv_core3_test_rgb_ops = {
+	.set = dv_core3_test_rgb_set,
+	.get = param_get_bool,
+};
+module_param_cb(dv_core3_test_rgb, &dv_core3_test_rgb_ops,
+		&dv_core3_test_rgb, 0600);
+MODULE_PARM_DESC(dv_core3_test_rgb,
+	"diag: known Core3 RGB stimulus for DV-as-HDR10, default off");
+module_param_array(dv_core3_test_rgb_values, uint, NULL, 0600);
+MODULE_PARM_DESC(dv_core3_test_rgb_values,
+	"diag: RGB gains in Q16, each clamped to 0..32768 (0..0.5)");
+
+static u32 dv_core3_test_word(u32 index, u32 original, u32 scale, bool enabled)
+{
+	u32 coeff[3];
+	int channel;
+
+	if (!enabled || index < 5 || index > 9 || scale > 15)
+		return original;
+	for (channel = 0; channel < 3; channel++) {
+		u32 gain = min_t(u32, READ_ONCE(dv_core3_test_rgb_values[channel]), 32768);
+
+		coeff[channel] = (((u64)gain << scale) + 32768) >> 16;
+	}
+	switch (index) {
+	case 5:
+		return coeff[0];
+	case 6:
+		return coeff[1] << 16;
+	case 7:
+		return 0;
+	case 8:
+		return coeff[2];
+	default:
+		return original & 0xffff0000;
+	}
+}
+
+/* Default-off experiment. Userspace derives the Q20 conversion from the actual
+ * VSVDB; binding all 32 bytes prevents reuse after the output target changes.
+ * Configuration is atomic and cannot be edited while enabled. No device ID,
+ * display coordinates or persistent setting is embedded in the driver.
+ */
+static DEFINE_SPINLOCK(dv_hdr10_encoding_lock);
+static bool dv_hdr10_encoding_enabled;
+static bool dv_hdr10_encoding_configured;
+static u8 dv_hdr10_encoding_target[32];
+static u8 dv_hdr10_encoding_seen[32];
+static s32 dv_hdr10_encoding_matrix[9];
+static int dv_hdr10_encoding_status;
+module_param_named(dv_hdr10_encoding_status, dv_hdr10_encoding_status, int, 0400);
+MODULE_PARM_DESC(dv_hdr10_encoding_status,
+	"diag: 0 bypass, 1 applied, -1 target mismatch/unconfigured, -2 coefficient overflow");
+
+static int dv_hdr10_encoding_enable_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned long flags;
+	bool enabled;
+	int ret = kstrtobool(val, &enabled);
+
+	if (ret)
+		return ret;
+	spin_lock_irqsave(&dv_hdr10_encoding_lock, flags);
+	if (enabled && !dv_hdr10_encoding_configured)
+		ret = -EINVAL;
+	else
+		dv_hdr10_encoding_enabled = enabled;
+	spin_unlock_irqrestore(&dv_hdr10_encoding_lock, flags);
+	if (!ret)
+		dolby_vision_set_toggle_flag(1);
+	return ret;
+}
+
+static int dv_hdr10_encoding_enable_get(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "%c\n",
+		READ_ONCE(dv_hdr10_encoding_enabled) ? 'Y' : 'N');
+}
+
+static int dv_hdr10_encoding_config_set(const char *val, const struct kernel_param *kp)
+{
+	char *copy, *cursor, *token;
+	u8 target[32];
+	s32 matrix[9];
+	unsigned long flags;
+	int count = 0, ret = -EINVAL;
+
+	copy = kstrdup(val, GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+	cursor = copy;
+	while ((token = strsep(&cursor, " \t\n")) != NULL) {
+		if (!*token)
+			continue;
+		if (count == 0) {
+			if (strlen(token) != 64 || hex2bin(target, token, 32))
+				goto out;
+		} else {
+			if (count > 9 || kstrtoint(token, 10, &matrix[count - 1]) ||
+			    matrix[count - 1] < -(8 << 20) || matrix[count - 1] > (8 << 20))
+				goto out;
+		}
+		count++;
+	}
+	if (count != 10 || !memchr_inv(target, 0, sizeof(target)))
+		goto out;
+	spin_lock_irqsave(&dv_hdr10_encoding_lock, flags);
+	if (dv_hdr10_encoding_enabled) {
+		ret = -EBUSY;
+	} else {
+		memcpy(dv_hdr10_encoding_target, target, sizeof(target));
+		memcpy(dv_hdr10_encoding_matrix, matrix, sizeof(matrix));
+		dv_hdr10_encoding_configured = true;
+		ret = 0;
+	}
+	spin_unlock_irqrestore(&dv_hdr10_encoding_lock, flags);
+out:
+	kfree(copy);
+	return ret;
+}
+
+static int dv_hdr10_encoding_config_get(char *buf, const struct kernel_param *kp)
+{
+	unsigned long flags;
+	int i, len;
+
+	spin_lock_irqsave(&dv_hdr10_encoding_lock, flags);
+	len = scnprintf(buf, PAGE_SIZE, "%*phN", 32, dv_hdr10_encoding_target);
+	for (i = 0; i < 9; i++)
+		len += scnprintf(buf + len, PAGE_SIZE - len, " %d", dv_hdr10_encoding_matrix[i]);
+	spin_unlock_irqrestore(&dv_hdr10_encoding_lock, flags);
+	return len + scnprintf(buf + len, PAGE_SIZE - len, "\n");
+}
+
+static int dv_hdr10_encoding_vsvdb_get(char *buf, const struct kernel_param *kp)
+{
+	unsigned long flags;
+	int len;
+
+	spin_lock_irqsave(&dv_hdr10_encoding_lock, flags);
+	len = scnprintf(buf, PAGE_SIZE, "%*phN\n", 32, dv_hdr10_encoding_seen);
+	spin_unlock_irqrestore(&dv_hdr10_encoding_lock, flags);
+	return len;
+}
+
+static const struct kernel_param_ops dv_hdr10_encoding_enable_ops = {
+	.set = dv_hdr10_encoding_enable_set, .get = dv_hdr10_encoding_enable_get,
+};
+static const struct kernel_param_ops dv_hdr10_encoding_config_ops = {
+	.set = dv_hdr10_encoding_config_set, .get = dv_hdr10_encoding_config_get,
+};
+static const struct kernel_param_ops dv_hdr10_encoding_vsvdb_ops = {
+	.get = dv_hdr10_encoding_vsvdb_get,
+};
+module_param_cb(dv_hdr10_encoding, &dv_hdr10_encoding_enable_ops, NULL, 0600);
+module_param_cb(dv_hdr10_encoding_config, &dv_hdr10_encoding_config_ops, NULL, 0600);
+module_param_cb(dv_hdr10_encoding_vsvdb, &dv_hdr10_encoding_vsvdb_ops, NULL, 0400);
+MODULE_PARM_DESC(dv_hdr10_encoding, "diag: VSVDB-bound linear output-basis conversion, default off");
+MODULE_PARM_DESC(dv_hdr10_encoding_config, "diag: 32-byte VSVDB hex followed by nine signed Q20 coefficients");
+
+static void dv_hdr10_encoding_apply(u32 dm[26], bool hdr10_ll, const u8 vsvdb[32])
+{
+	unsigned long flags;
+	s32 matrix[9];
+	u32 converted[5];
+	bool enabled, matches;
+	int status = 0;
+
+	spin_lock_irqsave(&dv_hdr10_encoding_lock, flags);
+	memcpy(dv_hdr10_encoding_seen, vsvdb, 32);
+	enabled = dv_hdr10_encoding_enabled && hdr10_ll;
+	matches = dv_hdr10_encoding_configured &&
+		!memcmp(dv_hdr10_encoding_target, vsvdb, 32);
+	memcpy(matrix, dv_hdr10_encoding_matrix, sizeof(matrix));
+	spin_unlock_irqrestore(&dv_hdr10_encoding_lock, flags);
+	if (enabled) {
+		status = -1;
+		if (matches) {
+			status = -2;
+			if (dv_hdr10_convert_b2a(dm + 5, matrix, converted)) {
+				memcpy(dm + 5, converted, sizeof(converted));
+				status = 1;
+			}
+		}
+	}
+	WRITE_ONCE(dv_hdr10_encoding_status, status);
+}
+
 bool is_core3_mute_reg(int index)
 {
   return (index == 12) ||                  // ipt_scale for ipt (bit depth?)
@@ -1990,6 +2194,9 @@ static int dolby_core3_set
   bool reset = false;
   u32 diag_enable = 0;
   bool reset_post_table = false;
+  bool test_rgb;
+  bool hdr10_ll;
+  u32 output_dm[26];
   static u32 last_md3[256];
 
   if (new_dovi_setting.diagnostic_enable || new_dovi_setting.dovi_ll_enable)
@@ -2135,12 +2342,19 @@ static int dolby_core3_set
   /* for delay */
 
   /* from addr 0x06 to 0x1F - Colour Space conversion metadata? */
+  hdr10_ll = new_dovi_setting.dovi_ll_enable && !new_dovi_setting.diagnostic_enable &&
+    xbmc_dv_hdr10_for_dv_ll && cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_HDR10;
+  test_rgb = READ_ONCE(dv_core3_test_rgb) && hdr10_ll;
+  for (i = 0; i < 26; i++)
+    output_dm[i] = dv_core3_test_word(i, p_core3_dm_regs[i],
+      (p_core3_dm_regs[9] >> 16) & 0xf, test_rgb);
+  dv_hdr10_encoding_apply(output_dm, hdr10_ll, new_dovi_setting.vsvdb_tbl);
   for (i = 0; i < 26; i++) {
     if (reset || p_core3_dm_regs[i] != last_dm[i] || is_core3_mute_reg(i)) {
       if ((dolby_vision_flags & FLAG_MUTE) && is_core3_mute_reg(i))
         VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 0x6 + i, 0);
       else
-        VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 0x6 + i, p_core3_dm_regs[i]);
+        VSYNC_WR_DV_REG(DOLBY_CORE3_REG_START + 0x6 + i, output_dm[i]);
     }
   }
 
