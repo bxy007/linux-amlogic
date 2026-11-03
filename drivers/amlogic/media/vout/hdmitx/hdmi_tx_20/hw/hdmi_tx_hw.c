@@ -2372,12 +2372,12 @@ static void hdmitx_set_packet(int type, unsigned char *DB, unsigned char *HB)
 				hdmitx_wr_reg(HDMITX_DWC_FC_VSDSIZE, 6);
 		}
 		if ((ieee_code == DOVI_IEEEOUI) && (HB[2] == 0x1b)) {
-			/*set dolby vsif data information*/
-			hdmitx_wr_reg(HDMITX_DWC_FC_VSDPAYLOAD1, DB[4]);
-			hdmitx_wr_reg(HDMITX_DWC_FC_VSDPAYLOAD2, DB[5]);
-			hdmitx_wr_reg(HDMITX_DWC_FC_VSDPAYLOAD3, DB[6]);
-			hdmitx_wr_reg(HDMITX_DWC_FC_VSDPAYLOAD4, DB[7]);
-			hdmitx_wr_reg(HDMITX_DWC_FC_VSDPAYLOAD5, DB[8]);
+			/* HB[2] includes the three-byte OUI; DB[3] is set above.
+			 * Copy L11 and reserved bytes too, clearing old packet data.
+			 */
+			for (i = 1; i < HB[2] - 3; i++)
+				hdmitx_wr_reg(HDMITX_DWC_FC_VSDPAYLOAD0 + i,
+					DB[3 + i]);
 		}
 		/*set hdr 10+ vsif data information*/
 		if (ieee_code == HDR10PLUS_IEEEOUI) {
