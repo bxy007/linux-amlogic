@@ -1745,6 +1745,51 @@ struct master_display_info_s drm_config_data;
 
 static unsigned int xbmc_hdr10_max_lum_override;
 static unsigned int xbmc_hdr10_max_cll_override;
+static bool xbmc_hdr10_mdcv_bt2020;
+
+static int xbmc_hdr10_mdcv_param_set(const char *val,
+				   const struct kernel_param *kp)
+{
+	int ret = param_set_bool(val, kp);
+
+	if (!ret && hdmitx_device.hdr_transfer_feature == T_SMPTE_ST_2084)
+		hdmitx_set_drm_pkt(&drm_config_data);
+
+	return ret;
+}
+
+static const struct kernel_param_ops xbmc_hdr10_mdcv_param_ops = {
+	.set = xbmc_hdr10_mdcv_param_set,
+	.get = param_get_bool,
+};
+
+module_param_cb(xbmc_hdr10_mdcv_bt2020, &xbmc_hdr10_mdcv_param_ops,
+		&xbmc_hdr10_mdcv_bt2020, 0600);
+MODULE_PARM_DESC(xbmc_hdr10_mdcv_bt2020,
+	"diag: override only HDR10 mastering primaries with BT.2020, default off");
+
+static void hdmitx_pack_mastering_primaries(unsigned char *db,
+					 const struct master_display_info_s *data)
+{
+	static const u16 bt2020[3][2] = {
+		{8500, 39850}, {6550, 2300}, {35400, 14600}
+	};
+	bool override = READ_ONCE(xbmc_hdr10_mdcv_bt2020) &&
+		((data->features >> 8) & 0xff) == T_SMPTE_ST_2084 &&
+		((data->features >> 16) & 0xff) == C_BT2020;
+	int primary, coordinate;
+
+	for (primary = 0; primary < 3; primary++) {
+		for (coordinate = 0; coordinate < 2; coordinate++) {
+			u32 value = override ? bt2020[primary][coordinate] :
+				data->primaries[primary][coordinate];
+			int index = 2 + (primary * 2 + coordinate) * 2;
+
+			db[index] = GET_LOW8BIT(value);
+			db[index + 1] = GET_HIGH8BIT(value);
+		}
+	}
+}
 
 static int xbmc_hdr10_param_set(const char *val, const struct kernel_param *kp)
 {
@@ -1925,18 +1970,7 @@ static void hdmitx_set_drm_pkt(struct master_display_info_s *data)
 		}
 
 		DRM_DB[1] = 0x0;
-		DRM_DB[2] = GET_LOW8BIT(data->primaries[0][0]);
-		DRM_DB[3] = GET_HIGH8BIT(data->primaries[0][0]);
-		DRM_DB[4] = GET_LOW8BIT(data->primaries[0][1]);
-		DRM_DB[5] = GET_HIGH8BIT(data->primaries[0][1]);
-		DRM_DB[6] = GET_LOW8BIT(data->primaries[1][0]);
-		DRM_DB[7] = GET_HIGH8BIT(data->primaries[1][0]);
-		DRM_DB[8] = GET_LOW8BIT(data->primaries[1][1]);
-		DRM_DB[9] = GET_HIGH8BIT(data->primaries[1][1]);
-		DRM_DB[10] = GET_LOW8BIT(data->primaries[2][0]);
-		DRM_DB[11] = GET_HIGH8BIT(data->primaries[2][0]);
-		DRM_DB[12] = GET_LOW8BIT(data->primaries[2][1]);
-		DRM_DB[13] = GET_HIGH8BIT(data->primaries[2][1]);
+		hdmitx_pack_mastering_primaries(DRM_DB, data);
 		DRM_DB[14] = GET_LOW8BIT(data->white_point[0]);
 		DRM_DB[15] = GET_HIGH8BIT(data->white_point[0]);
 		DRM_DB[16] = GET_LOW8BIT(data->white_point[1]);
