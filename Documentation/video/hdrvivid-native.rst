@@ -52,8 +52,9 @@ before releasing its reference.
 
 The hdr_cap sysfs output includes ``CUVA native RX: 1`` only when both a
 usable transmitter and a compatible receiver capability are present.
-Kodi uses this signal to prefer native Vivid over its optional statistics
-to Dolby Vision conversion and VS10 mapping. With older kernels or a
+When HDR Vivid to Dolby Vision conversion is disabled, Kodi uses this signal
+to prefer native Vivid over VS10 mapping. Enabling that conversion takes
+priority over native receiver output. With older kernels or a
 receiver without this capability, the previous conversion policy remains.
 No display model, resolution or media filename is used in that decision.
 
