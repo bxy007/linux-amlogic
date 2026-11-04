@@ -24,6 +24,8 @@
 #include <linux/interrupt.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
+#include <linux/dma-mapping.h>
+#include <dt-bindings/clock/amlogic,sc2-clkc.h>
 #include <linux/init.h>
 #include <linux/device.h>
 #include <linux/mm.h>
@@ -85,6 +87,10 @@ static void hdmitx_set_hdr10plus_pkt(unsigned int flag,
 	struct hdr10plus_para *data);
 static void hdmitx_set_cuva_hdr_vsif(struct cuva_hdr_vsif_para *data);
 static void hdmitx_set_cuva_hdr_vs_emds(struct cuva_hdr_vs_emds_para *data);
+static void hdmitx_cuva_emp_stop_locked(struct hdmitx_dev *hdev);
+/* Packet transport can stop before the caller commits its next output format. */
+static bool cuva_emp_hdr_owner;
+static bool cuva_sdr_handoff_done;
 static void hdmitx_set_emp_pkt(unsigned char *data,
 	unsigned int type, unsigned int size);
 static int check_fbc_special(unsigned char *edid_dat);
@@ -1587,6 +1593,8 @@ static unsigned int hdr_sdr_seq;
 
 static void hdmitx_hdr_to_sdr_commit(struct hdmitx_dev *hdev)
 {
+	/* Commit dynamic-packet cleanup with the debounced SDR transition. */
+	hdmitx_cuva_emp_stop_locked(hdev);
 	hdr_sdr_pending = 0;
 	hdev->colormetry = 0;
 	hdev->hwop.cntlconfig(hdev, CONF_AVI_BT2020, CLR_AVI_BT2020);
@@ -1614,6 +1622,53 @@ static void hdmitx_hdr_to_sdr_cancel(void)
 	hdr_sdr_pending = 0;
 	cancel_delayed_work(&hdr_sdr_dwork);
 	pr_info("hdmitx_hdr_to_sdr_cancel: seq=%u\n", hdr_sdr_seq);
+}
+
+/* A reset withdraws metadata, without selecting a desktop output format.
+ * Caller holds edid_spinlock. The next explicit format callback takes over.
+ */
+static bool hdmitx_cuva_release_metadata(struct hdmitx_dev *hdev,
+				       struct master_display_info_s *data)
+{
+	if (data || (!cuva_emp_hdr_owner && !cuva_sdr_handoff_done) ||
+	    !hdev->rxcap.hdr_info2.hdr_support)
+		return false;
+	hdmitx_cuva_emp_stop_locked(hdev);
+	return true;
+}
+
+/* Caller holds edid_spinlock. Keep an explicit SDR declaration on the wire
+ * when releasing native Vivid, rather than disabling DRM and enabling it
+ * again after the normal debounce interval. The existing HDR worker retires
+ * the zero DRM packet and protects a newer HDR output with hdr_sdr_seq.
+ */
+static bool hdmitx_cuva_sdr_handoff(struct hdmitx_dev *hdev,
+				  struct master_display_info_s *data)
+{
+	unsigned char hb[3] = {0x87, 0x01, 26};
+	unsigned char db[26] = {0};
+
+	if (!data || (!cuva_emp_hdr_owner && !cuva_sdr_handoff_done) ||
+	    !hdev->rxcap.hdr_info2.hdr_support)
+		return false;
+	if (((data->features >> 8) & 0xff) != T_BT709 ||
+	    ((data->features >> 16) & 0xff) != C_BT709)
+		return false;
+	/* Repeated GUI resets/SDR callbacks must not reopen the packet gap. */
+	if (cuva_sdr_handoff_done)
+		return true;
+
+	cuva_emp_hdr_owner = false;
+	cuva_sdr_handoff_done = true;
+	hdmitx_cuva_emp_stop_locked(hdev);
+	hdmitx_hdr_to_sdr_cancel();
+	hdev->hdr_transfer_feature = T_BT709;
+	hdev->hdr_color_feature = C_BT709;
+	hdev->colormetry = 0;
+	hdev->hwop.setpacket(HDMI_PACKET_DRM, db, hb);
+	hdev->hwop.cntlconfig(hdev, CONF_AVI_BT2020, CLR_AVI_BT2020);
+	schedule_work(&hdev->work_hdr);
+	return true;
 }
 
 static void hdr_sdr_dwork_func(struct work_struct *work)
@@ -1925,7 +1980,20 @@ static void hdmitx_set_drm_pkt(struct master_display_info_s *data)
 		}
 	}
 
+	if (hdmitx_cuva_release_metadata(hdev, data)) {
+		spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+		return;
+	}
+	if (hdmitx_cuva_sdr_handoff(hdev, data)) {
+		memset(DRM_DB, 0, sizeof(DRM_DB));
+		clear_hdr10plus_flag = 0;
+		spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+		return;
+	}
+	cuva_emp_hdr_owner = false;
+	cuva_sdr_handoff_done = false;
 	if (!data || !hdev->rxcap.hdr_info2.hdr_support) {
+		hdmitx_cuva_emp_stop_locked(hdev);
 		hdmitx_hdr_to_sdr_cancel();
 		DRM_HB[1] = 0;
 		DRM_HB[2] = 0;
@@ -2129,6 +2197,12 @@ void hdmitx_set_vsif_pkt(enum eotf_type type,
 	if (hdev->bist_lock) {
 		spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
 		return;
+	}
+	if (type == EOTF_T_DOLBYVISION || type == EOTF_T_LL_MODE || signal_sdr)
+		hdmitx_cuva_emp_stop_locked(hdev);
+	if (type == EOTF_T_DOLBYVISION || type == EOTF_T_LL_MODE) {
+		cuva_emp_hdr_owner = false;
+		cuva_sdr_handoff_done = false;
 	}
 	if (data == NULL)
 		memcpy(&vsif_debug_info.data, &para,
@@ -2497,10 +2571,18 @@ static void hdmitx_set_hdr10plus_pkt(unsigned int flag,
 	struct hdmitx_dev *hdev = &hdmitx_device;
 	unsigned char VEN_HB[3] = {0x81, 0x01, 0x1b};
 	unsigned char VEN_DB[27] = {0x00};
+	unsigned long flags;
 
 	hdmi_debug();
 	if (hdev->bist_lock)
 		return;
+	if (flag && data) {
+		spin_lock_irqsave(&hdev->edid_spinlock, flags);
+		hdmitx_cuva_emp_stop_locked(hdev);
+		cuva_emp_hdr_owner = false;
+		cuva_sdr_handoff_done = false;
+		spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+	}
 	if (data)
 		memcpy(&hdr10p_config_data, data,
 		       sizeof(struct hdr10plus_para));
@@ -2607,21 +2689,37 @@ struct hdmi_packet_t {
 	u8 no_used; /* padding to 32 bytes */
 };
 
+/* Coherent, alternating EMP buffers: callbacks run from the video IRQ. */
+static struct hdmi_packet_t *cuva_emp_buffer;
+static dma_addr_t cuva_emp_dma;
+static unsigned int cuva_emp_slot;
+static unsigned int cuva_emp_updates;
+static bool cuva_emp_active;
+
+/* Caller holds edid_spinlock. Other packet owners are left untouched. */
+static void hdmitx_cuva_emp_stop_locked(struct hdmitx_dev *hdev)
+{
+	if (!cuva_emp_active)
+		return;
+	hdev->hwop.cntlconfig(hdev, CONF_EMP_NUMBER, 0);
+	cuva_emp_active = false;
+}
+
 static void hdmitx_set_cuva_hdr_vs_emds(struct cuva_hdr_vs_emds_para *data)
 {
 	struct hdmi_packet_t vs_emds[3];
 	unsigned long flags;
 	struct hdmitx_dev *hdev = &hdmitx_device;
-	static unsigned char *virt_ptr;
-	static unsigned char *virt_ptr_align32bit;
-	unsigned long phys_ptr;
+	dma_addr_t phys_ptr;
 
 	memset(vs_emds, 0, sizeof(vs_emds));
-	hdmi_debug();
-
 	spin_lock_irqsave(&hdev->edid_spinlock, flags);
 	if (!data) {
-		hdev->hwop.cntlconfig(hdev, CONF_EMP_NUMBER, 0);
+		hdmitx_cuva_emp_stop_locked(hdev);
+		spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
+		return;
+	}
+	if (!cuva_emp_buffer || hdev->chip_type < MESON_CPU_ID_G12A) {
 		spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
 		return;
 	}
@@ -2710,22 +2808,16 @@ static void hdmitx_set_cuva_hdr_vs_emds(struct cuva_hdr_vs_emds_para *data)
 	vs_emds[2].pb[5] = data->max_display_mastering_lum >> 8;
 	vs_emds[2].pb[6] = data->max_display_mastering_lum & 0xff;
 
-	if (!virt_ptr) { /* init virt_ptr and virt_ptr_align32bit */
-		virt_ptr = kzalloc((sizeof(vs_emds) + 0x1f), GFP_KERNEL);
-		virt_ptr_align32bit = (unsigned char *)
-			((((unsigned long)virt_ptr) + 0x1f) & (~0x1f));
-	}
-	memcpy(virt_ptr_align32bit, vs_emds, sizeof(vs_emds));
-	phys_ptr = virt_to_phys(virt_ptr_align32bit);
-
-	if (!data)
-		pr_info("emp_pkt data is null: %lx\n", phys_ptr);
-	else
-		pr_info("emp_pkt phys_ptr: %lx\n", phys_ptr);
-
-	hdev->hwop.cntlconfig(hdev, CONF_EMP_NUMBER,
-			      sizeof(vs_emds) / (sizeof(struct hdmi_packet_t)));
+	cuva_emp_slot ^= 1;
+	memcpy(cuva_emp_buffer + cuva_emp_slot * 3, vs_emds, sizeof(vs_emds));
+	phys_ptr = cuva_emp_dma + cuva_emp_slot * sizeof(vs_emds);
+	dma_wmb();
 	hdev->hwop.cntlconfig(hdev, CONF_EMP_PHY_ADDR, phys_ptr);
+	hdev->hwop.cntlconfig(hdev, CONF_EMP_NUMBER, ARRAY_SIZE(vs_emds));
+	cuva_emp_active = true;
+	cuva_emp_hdr_owner = true;
+	cuva_sdr_handoff_done = false;
+	cuva_emp_updates++;
 	spin_unlock_irqrestore(&hdev->edid_spinlock, flags);
 }
 
@@ -4018,6 +4110,11 @@ static ssize_t _hdr_cap_show(struct device *dev,
 
 	pos += snprintf(buf + pos, PAGE_SIZE, "\n\ncolorimetry_data: %x\n",
 		hdr->colorimetry_support);
+	pos += scnprintf(buf + pos, PAGE_SIZE - pos, "CUVA native RX: %u\n",
+		!!(cuva_emp_buffer && hdmitx_device.chip_type >= MESON_CPU_ID_G12A &&
+		   cuva->ieeeoui == CUVA_IEEEOUI && cuva->length >= 14 &&
+		   cuva->system_start_code >= 1 && cuva->version_code >= 1 &&
+		   cuva->rx_mode_sup));
 	if (cuva->ieeeoui == CUVA_IEEEOUI) {
 		pos += snprintf(buf + pos, PAGE_SIZE, "CUVA supported: 1\n");
 		pos += snprintf(buf + pos, PAGE_SIZE,
@@ -4056,6 +4153,26 @@ static ssize_t hdr_cap_show(struct device *dev,
 	}
 
 	return _hdr_cap_show(dev, attr, buf, info);
+}
+
+static ssize_t cuva_emds_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	unsigned long flags;
+	int pos, i;
+	u8 *packet;
+
+	spin_lock_irqsave(&hdmitx_device.edid_spinlock, flags);
+	pos = scnprintf(buf, PAGE_SIZE, "active=%u updates=%u\n",
+		cuva_emp_active, cuva_emp_updates);
+	if (cuva_emp_buffer && cuva_emp_updates) {
+		packet = (u8 *)(cuva_emp_buffer + cuva_emp_slot * 3);
+		for (i = 0; i < 3 * sizeof(struct hdmi_packet_t); i++)
+			pos += scnprintf(buf + pos, PAGE_SIZE - pos, "%02x", packet[i]);
+		pos += scnprintf(buf + pos, PAGE_SIZE - pos, "\n");
+	}
+	spin_unlock_irqrestore(&hdmitx_device.edid_spinlock, flags);
+	return pos;
 }
 
 static ssize_t hdr_cap2_show(struct device *dev,
@@ -5874,6 +5991,7 @@ static DEVICE_ATTR(vesa_cap, 0444, show_vesa_cap, NULL);
 static DEVICE_ATTR(aud_cap, 0444, show_aud_cap, NULL);
 static DEVICE_ATTR(hdmi_hdr_status, 0444, show_hdmi_hdr_status, NULL);
 static DEVICE_ATTR(hdr_cap, 0444, hdr_cap_show, NULL);
+static DEVICE_ATTR(cuva_emds, 0444, cuva_emds_show, NULL);
 static DEVICE_ATTR(hdr_cap2, 0444, hdr_cap2_show, NULL);
 static DEVICE_ATTR(dv_cap, 0444, show_dv_cap, NULL);
 static DEVICE_ATTR(dv_cap2, 0444, show_dv_cap2, NULL);
@@ -7391,6 +7509,55 @@ static void amhdmitx_clktree_probe(struct device *hdmitx_dev)
 		hdmitx_device.hdmitx_clk_tree.venci_1_gate = venci_1_gate;
 }
 
+/* EMP crosses from TMDS into the ESM clock domain even without HDCP.
+ * Keep a framework reference so late unused-clock cleanup cannot gate DMA.
+ */
+static void cuva_emp_clock_disable(void *clock)
+{
+	clk_disable_unprepare(clock);
+}
+
+static void cuva_emp_clock_put(void *clock)
+{
+	clk_put(clock);
+}
+
+static int cuva_emp_clock_prepare(struct device *dev)
+{
+	struct clk *clock = devm_clk_get(dev, "hdcp22_tx_esm");
+	struct of_phandle_args spec = {0};
+	int ret;
+
+	if (IS_ERR(clock)) {
+		ret = PTR_ERR(clock);
+		if (ret == -EPROBE_DEFER)
+			return ret;
+		/* Old SC2 DTs omit this consumer clock. Use the published SoC
+		 * provider binding without requiring a board-specific DTB update.
+		 * Earlier HDMI20 SoCs retain their legacy register clock setup.
+		 */
+		if (hdmitx_device.chip_type != MESON_CPU_ID_SC2)
+			return 0;
+		spec.np = of_find_compatible_node(NULL, NULL, "amlogic,sc2-clkc");
+		if (!spec.np)
+			return -ENODEV;
+		spec.args_count = 1;
+		spec.args[0] = CLKID_HDCP22_ESMCLK_GATE;
+		clock = of_clk_get_from_provider(&spec);
+		of_node_put(spec.np);
+		if (IS_ERR(clock))
+			return PTR_ERR(clock);
+		ret = devm_add_action_or_reset(dev, cuva_emp_clock_put, clock);
+		if (ret)
+			return ret;
+	}
+
+	ret = clk_prepare_enable(clock);
+	if (ret)
+		return ret;
+	return devm_add_action_or_reset(dev, cuva_emp_clock_disable, clock);
+}
+
 static int amhdmitx_probe(struct platform_device *pdev)
 {
 	int r, ret = 0;
@@ -7399,6 +7566,22 @@ static int amhdmitx_probe(struct platform_device *pdev)
 	amhdmitx_device_init(&hdmitx_device);
 
 	ret = amhdmitx_get_dt_info(pdev);
+	if (hdmitx_device.chip_type >= MESON_CPU_ID_G12A &&
+	    !dma_coerce_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32)))
+		cuva_emp_buffer = dmam_alloc_coherent(&pdev->dev,
+			6 * sizeof(struct hdmi_packet_t), &cuva_emp_dma, GFP_KERNEL);
+	if (hdmitx_device.chip_type >= MESON_CPU_ID_G12A && !cuva_emp_buffer)
+		dev_warn(&pdev->dev, "native HDR Vivid unavailable: EMP DMA allocation failed\n");
+	if (cuva_emp_buffer) {
+		ret = cuva_emp_clock_prepare(&pdev->dev);
+		if (ret) {
+			cuva_emp_buffer = NULL;
+			if (ret == -EPROBE_DEFER)
+				return ret;
+			dev_warn(&pdev->dev,
+				 "native HDR Vivid unavailable: EMP clock failed (%d)\n", ret);
+		}
+	}
 
 	amhdmitx_clktree_probe(&(pdev->dev));
 
@@ -7444,6 +7627,7 @@ static int amhdmitx_probe(struct platform_device *pdev)
 	ret = device_create_file(dev, &dev_attr_aud_cap);
 	ret = device_create_file(dev, &dev_attr_hdmi_hdr_status);
 	ret = device_create_file(dev, &dev_attr_hdr_cap);
+	ret = device_create_file(dev, &dev_attr_cuva_emds);
 	ret = device_create_file(dev, &dev_attr_hdr_cap2);
 	ret = device_create_file(dev, &dev_attr_dv_cap);
 	ret = device_create_file(dev, &dev_attr_dv_cap2);
@@ -7551,6 +7735,7 @@ static int amhdmitx_remove(struct platform_device *pdev)
 {
 	struct device *dev = hdmitx_device.hdtx_dev;
 
+	hdmitx_set_cuva_hdr_vs_emds(NULL);
 	cancel_delayed_work_sync(&hdr_sdr_dwork);
 	cancel_work_sync(&hdmitx_device.work_hdr);
 
@@ -7583,6 +7768,7 @@ static int amhdmitx_remove(struct platform_device *pdev)
 	device_remove_file(dev, &dev_attr_vesa_cap);
 	device_remove_file(dev, &dev_attr_disp_cap_3d);
 	device_remove_file(dev, &dev_attr_hdr_cap);
+	device_remove_file(dev, &dev_attr_cuva_emds);
 	device_remove_file(dev, &dev_attr_hdr_cap2);
 	device_remove_file(dev, &dev_attr_dv_cap);
 	device_remove_file(dev, &dev_attr_dv_cap2);

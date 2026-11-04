@@ -4008,8 +4008,11 @@ uint32_t sink_hdr_support(const struct vinfo_s *vinfo)
 		== 1))
 			hdr_cap |= HDRP_SUPPORT;
 
-		if (vinfo->hdr_info.cuva_info.ieeeoui
-			== CUVA_IEEEOUI)
+		if (vinfo->hdr_info.cuva_info.ieeeoui == CUVA_IEEEOUI &&
+		    vinfo->hdr_info.cuva_info.length >= 14 &&
+		    vinfo->hdr_info.cuva_info.system_start_code >= 1 &&
+		    vinfo->hdr_info.cuva_info.version_code >= 1 &&
+		    vinfo->hdr_info.cuva_info.rx_mode_sup)
 		hdr_cap |= CUVA_SUPPORT;
 		if (vinfo->hdr_info.colorimetry_support & 0xe0)
 			hdr_cap |= BT2020_SUPPORT;
@@ -7045,6 +7048,12 @@ static bool cuva_metadata_update(
 
 	cuva_hdr_vsif_pkt_update(vsif_paras);
 	cuva_hdr_emds_pkt_update(emds_paras);
+	if (emds_paras->system_start_code != 1)
+		return false;
+	emds_paras->transfer_character = ((vf->signal_type >> 8) & 0xff) == 18;
+	emds_paras->max_display_mastering_lum = min_t(u32, 65535,
+		vf->prop.master_display_colour.luminance[0] / 10000);
+
 
 	if (last_hdmitx_cuva_valid[vd_path] &&
 	    (memcmp(&last_hdmitx_vsif_params[vd_path], vsif_paras, sizeof(*vsif_paras)) == 0) &&
@@ -7242,7 +7251,8 @@ void update_cuva_pkt(bool enable,
 		    (sink_hdr_support(vinfo) & CUVA_SUPPORT) &&
 		    (!sink_support_dolby_vision(vinfo))) {
 			pr_csc(2, "update_cuva_pkt: DISABLE_VSIF\n");
-			if (vinfo->hdr_info.cuva_info.monitor_mode_sup == 1) {
+			if (!vinfo->hdr_info.cuva_info.rx_mode_sup &&
+		    vinfo->hdr_info.cuva_info.monitor_mode_sup == 1) {
 				vdev->fresh_tx_cuva_hdr_vsif(
 					NULL);
 			} else {
@@ -7329,7 +7339,8 @@ void send_cuva_pkt(enum vd_path_e vd_path)
 			return;
 		vdev->fresh_tx_hdr_pkt(
 			&cur_send_info);
-		if (vinfo->hdr_info.cuva_info.monitor_mode_sup == 1) {
+		if (!vinfo->hdr_info.cuva_info.rx_mode_sup &&
+		    vinfo->hdr_info.cuva_info.monitor_mode_sup == 1) {
 			vdev->fresh_tx_cuva_hdr_vsif(
 				&cur_cuva_params);
 		} else {
@@ -7347,7 +7358,8 @@ void send_cuva_pkt(enum vd_path_e vd_path)
 		(get_cuva_pkt_delay() > 1)) {
 		if (!vdev)
 			return;
-		if (vinfo->hdr_info.cuva_info.monitor_mode_sup == 1) {
+		if (!vinfo->hdr_info.cuva_info.rx_mode_sup &&
+		    vinfo->hdr_info.cuva_info.monitor_mode_sup == 1) {
 			vdev->fresh_tx_cuva_hdr_vsif(
 				&cur_cuva_params);
 		} else {
@@ -7439,7 +7451,8 @@ static void hdr_tx_pkt_cb(
 			if (cur_csc_type[vd_path] ==
 				VPP_MATRIX_BT2020YUV_BT2020RGB_CUVA) {
 				if (vdev) {
-					if (vinfo->hdr_info.cuva_info.monitor_mode_sup
+					if (!vinfo->hdr_info.cuva_info.rx_mode_sup &&
+				    vinfo->hdr_info.cuva_info.monitor_mode_sup
 						== 1) {
 					if (vdev->fresh_tx_cuva_hdr_vsif)
 						vdev->fresh_tx_cuva_hdr_vsif
@@ -7623,7 +7636,8 @@ static void hdr_tx_pkt_cb(
 						&send_info);
 				} else {
 					/* send cuva packet */
-				if (vinfo->hdr_info.cuva_info.monitor_mode_sup
+				if (!vinfo->hdr_info.cuva_info.rx_mode_sup &&
+				    vinfo->hdr_info.cuva_info.monitor_mode_sup
 						== 1) {
 					if (vdev->fresh_tx_cuva_hdr_vsif)
 						vdev->fresh_tx_cuva_hdr_vsif(
@@ -7693,7 +7707,8 @@ static void hdr_tx_pkt_cb(
 			} else if (cur_csc_type[vd_path] ==
 				VPP_MATRIX_BT2020YUV_BT2020RGB_CUVA) {
 				if (vdev) {
-				if (vinfo->hdr_info.cuva_info.monitor_mode_sup
+				if (!vinfo->hdr_info.cuva_info.rx_mode_sup &&
+				    vinfo->hdr_info.cuva_info.monitor_mode_sup
 						== 1) {
 					if (vdev->fresh_tx_cuva_hdr_vsif)
 						vdev->fresh_tx_cuva_hdr_vsif(

@@ -85,7 +85,7 @@ static const char *policy_str[3] = {
 	"force_output"
 };
 
-static const char *input_str[9] = {
+static const char *input_str[10] = {
 	"NONE",
 	"HDR",
 	"HDR+",
@@ -95,6 +95,7 @@ static const char *input_str[9] = {
 	"SDR",
 	"MVC",
 	"CUVA_HDR",
+	"CUVA_HLG",
 };
 
 /* output_format_e */
@@ -255,15 +256,16 @@ int hdr_policy_process(
 			/* vd1 bypass hdr+ when vd2 off */
 			hdr10_plus_process_mode[vd_path] = PROC_BYPASS;
 			target_format[vd_path] = BT2020_PQ_DYNAMIC;
+		} else if ((source_format[vd_path] == HDRTYPE_CUVA_HDR ||
+			    source_format[vd_path] == HDRTYPE_CUVA_HLG) && cuva_support) {
+			/* Send original pixels and metadata to the receiver. */
+			cuva_hdr_process_mode[vd_path] = PROC_BYPASS;
+			cuva_hlg_process_mode[vd_path] = PROC_BYPASS;
+			target_format[vd_path] = BT2020YUV_BT2020RGB_CUVA;
 		} else if ((source_format[vd_path] == HDRTYPE_CUVA_HDR) &&
 			hdr10_plus_support) {
 			cuva_hdr_process_mode[vd_path] = PROC_CUVA_TO_HDR;
 			target_format[vd_path] = BT2020_PQ;
-		} else if ((source_format[vd_path] == HDRTYPE_CUVA_HDR) &&
-			(sink_hdr_support(vinfo)
-			& CUVA_SUPPORT)) {
-			cuva_hdr_process_mode[vd_path] = PROC_BYPASS;
-			target_format[vd_path] = BT2020YUV_BT2020RGB_CUVA;
 		} else if ((source_format[vd_path] == HDRTYPE_CUVA_HDR) &&
 			(sink_hdr_support(vinfo)
 			& HDR_SUPPORT)) {
@@ -616,6 +618,7 @@ int hdr_policy_process(
 #endif
 				}
 				break;
+			case HDRTYPE_CUVA_HLG:
 			case HDRTYPE_CUVA_HDR:
 				/* source cuva */
 				if (cuva_support &&
@@ -1326,6 +1329,14 @@ void hdmi_packet_process(
 		/* continue */
 	}
 
+	/* Output-format caches may already have been reset by a GUI/mode change.
+	 * Explicitly release native EMP for every non-CUVA target before an early
+	 * return; the transmitter makes an inactive release a no-op.
+	 */
+	if (target_format[vd_path] != BT2020YUV_BT2020RGB_CUVA &&
+	    vdev->fresh_tx_cuva_hdr_vs_emds)
+		vdev->fresh_tx_cuva_hdr_vs_emds(NULL);
+
 	if ((target_format[vd_path] == cur_output_format) &&
 	    (cur_output_format != BT2020_PQ_DYNAMIC) &&
 	    !(signal_change_flag & SIG_FORCE_CHG) &&
@@ -1357,7 +1368,8 @@ void hdmi_packet_process(
 				(void *)NULL);
 		} else if (vdev->fresh_tx_cuva_hdr_vsif &&
 			vdev->fresh_tx_cuva_hdr_vs_emds) {
-			if (vinfo->hdr_info.cuva_info.monitor_mode_sup == 1) {
+			if (!vinfo->hdr_info.cuva_info.rx_mode_sup &&
+			    vinfo->hdr_info.cuva_info.monitor_mode_sup == 1) {
 				vdev->fresh_tx_cuva_hdr_vsif(
 					NULL);
 			} else {
@@ -1446,7 +1458,7 @@ void hdmi_packet_process(
 		vd_signal.signal_type = SIGNAL_HDR10PLUS;
 		break;
 	case BT2020YUV_BT2020RGB_CUVA:
-			/* same as hdr10 */
+			/* Supplemental static signalling follows the unmodified base. */
 			send_info.features =
 			(0 << 30) /*sdr output 709*/
 			| (1 << 29)	/*video available*/
@@ -1454,7 +1466,7 @@ void hdmi_packet_process(
 			| (0 << 25)	/* limit */
 			| (1 << 24)	/*color available*/
 			| (9 << 16)
-			| (16 << 8)
+			| ((source_type[vd_path] == HDRTYPE_CUVA_HLG ? 18 : 16) << 8)
 			| (10 << 0);	/* bt2020c */
 		vd_signal.signal_type = SIGNAL_CUVA;
 		break;
@@ -1500,7 +1512,8 @@ void hdmi_packet_process(
 		} else {
 			if (vdev->fresh_tx_hdr_pkt)
 				vdev->fresh_tx_hdr_pkt(&send_info);
-			if (vinfo->hdr_info.cuva_info.monitor_mode_sup == 1) {
+			if (!vinfo->hdr_info.cuva_info.rx_mode_sup &&
+			    vinfo->hdr_info.cuva_info.monitor_mode_sup == 1) {
 				if (vdev->fresh_tx_cuva_hdr_vsif)
 					vdev->fresh_tx_cuva_hdr_vsif(
 						hdmitx_vsif_param);
@@ -1719,6 +1732,7 @@ void video_post_process(
 			hdr_proc(vf, OSD1_HDR, SDR_CUVA, vinfo, NULL);
 		}
 		break;
+	case HDRTYPE_CUVA_HLG:
 	case HDRTYPE_CUVA_HDR:
 		if (vd_path == VD2_PATH && is_dolby_vision_on()) {
 			hdr_proc(vf, VD2_HDR, CUVA_IPT, vinfo, NULL);

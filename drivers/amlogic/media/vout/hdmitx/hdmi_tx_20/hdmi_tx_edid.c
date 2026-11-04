@@ -937,6 +937,8 @@ static void _Edid_ParsingVendSpec(struct dv_info *dv,
 		return;
 	}
 	if (ieeeoui == CUVA_IEEEOUI) {
+		if (length < 14)
+			return;
 		memcpy(cuva->rawdata, cuva_dat, 15); /* 15, fixed length */
 		cuva->length = cuva_dat[0] & 0x1f;
 		cuva->ieeeoui = cuva_dat[2] |
