@@ -2292,6 +2292,15 @@ enum hdr_process_sel hdr_func(
 	memset(&hdr_mtx_param, 0, sizeof(struct hdr_proc_mtx_param_s));
 	memset(&hdr_lut_param, 0, sizeof(struct hdr_proc_lut_param_s));
 
+	/* Software PQ OSD is already full-range BT.2020 RGB.  Bypass the
+	 * complete SDR-to-HDR transform, not just its transfer LUTs: applying
+	 * the BT.709-to-BT.2020 gamut matrix to PQ values also changes colors
+	 * and luminance.  HDR_BYPASS retains RGB-to-limited-YCbCr conversion
+	 * for the video blend path, including the G12 OSD blend workaround.
+	 */
+	if (module_sel == OSD1_HDR && osd_pq_bypass)
+		hdr_process_select = HDR_BYPASS | RGB_OSD;
+
 	if ((module_sel == OSD1_HDR) &&
 	    (cpu_after_eq(MESON_CPU_MAJOR_ID_G12A))) {
 		/* turn off OSD mtx and use HDR for g12, sm1, tl1 */
@@ -2345,8 +2354,7 @@ enum hdr_process_sel hdr_func(
 		hdr_lut_param.hist_en = LUT_OFF;
 	} else if (hdr_process_select & HDR_BYPASS ||
 		   hdr_process_select & HLG_BYPASS ||
-		   hdr_process_select & CUVA_BYPASS ||
-		   (module_sel == OSD1_HDR && osd_pq_bypass)) {
+		   hdr_process_select & CUVA_BYPASS) {
 		for (i = 0; i < HDR2_OETF_LUT_SIZE; i++) {
 			hdr_lut_param.oetf_lut[i] =	oe_y_lut_bypass[i];
 			hdr_lut_param.ogain_lut[i] = oo_y_lut_bypass[i];
