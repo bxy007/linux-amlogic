@@ -70,6 +70,7 @@
 #include <linux/math64.h>
 #include "dv_hdr10_encoding.h"
 #include "dv_std_ycc.h"
+#include "dv_std_ipt.h"
 
 DEFINE_SPINLOCK(dovi_lock);
 
@@ -775,6 +776,72 @@ static bool dv_std_ycc_last_colour_valid;
 static u32 dv_std_ycc_last_core3_mode;
 static bool dv_std_ycc_last_bypass_csc1;
 
+/* Standard-DV direct output IPT shares the frame-matched source cache above,
+ * but has a separate request/state. Native algorithm results stay untouched.
+ * The older explicitly selected YCC experiment takes precedence. */
+static bool dv_std_ipt_enabled;
+static bool dv_std_ipt_active;
+static u32 dv_std_ipt_request;
+static u32 dv_std_ipt_handled_request;
+static int dv_std_ipt_error;
+static const char *dv_std_ipt_reason = "disabled";
+static struct dv_std_ipt_setting dv_std_ipt_work;
+static u8 dv_std_ipt_output_metadata[DV_STD_YCC_META_MAX];
+
+static int dv_std_ipt_enable_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned long flags;
+	bool enabled;
+	int ret = kstrtobool(val, &enabled);
+
+	if (ret)
+		return ret;
+	spin_lock_irqsave(&dv_std_ycc_lock, flags);
+	if (dv_std_ipt_enabled != enabled) {
+		dv_std_ipt_enabled = enabled;
+		dv_std_ipt_request++;
+	}
+	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
+	dolby_vision_set_toggle_flag(1);
+	return 0;
+}
+
+static int dv_std_ipt_enable_get(char *buf, const struct kernel_param *kp)
+{
+	return scnprintf(buf, PAGE_SIZE, "%c\n",
+		READ_ONCE(dv_std_ipt_enabled) ? 'Y' : 'N');
+}
+
+static int dv_std_ipt_status_get(char *buf, const struct kernel_param *kp)
+{
+	unsigned long flags;
+	int len;
+
+	spin_lock_irqsave(&dv_std_ycc_lock, flags);
+	len = scnprintf(buf, PAGE_SIZE,
+		"experimental=1 gui_qualified=0 route=direct_ipt enabled=%u active=%u reason=%s error=%d request=%u handled=%u epoch=%u source=%llu\n",
+		dv_std_ipt_enabled, dv_std_ipt_active, dv_std_ipt_reason,
+		dv_std_ipt_error, dv_std_ipt_request, dv_std_ipt_handled_request,
+		dv_std_ycc_epoch,
+		(unsigned long long)dv_std_ycc_committed_source.serial);
+	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
+	return len;
+}
+
+static const struct kernel_param_ops dv_std_ipt_enable_ops = {
+	.set = dv_std_ipt_enable_set,
+	.get = dv_std_ipt_enable_get,
+};
+static const struct kernel_param_ops dv_std_ipt_status_ops = {
+	.get = dv_std_ipt_status_get,
+};
+module_param_cb(dv_std_ipt, &dv_std_ipt_enable_ops, NULL, 0600);
+module_param_cb(dv_std_ipt_status, &dv_std_ipt_status_ops, NULL, 0400);
+MODULE_PARM_DESC(dv_std_ipt,
+	"Experimental SC2 standard-DV direct target IPT, default off");
+MODULE_PARM_DESC(dv_std_ipt_status,
+	"Direct target IPT submission state and native fallback reason");
+
 static int dv_std_ycc_enable_set(const char *val, const struct kernel_param *kp)
 {
 	unsigned long flags;
@@ -844,6 +911,8 @@ static void dv_std_ycc_invalidate_source(void)
 	dv_std_ycc_committed_source.valid = false;
 	if (dv_std_ycc_active || dv_std_ycc_enabled)
 		dv_std_ycc_request++;
+	if (dv_std_ipt_active || dv_std_ipt_enabled)
+		dv_std_ipt_request++;
 	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
 	/* Keep active latched until native settings are submitted or cores stop. */
 }
@@ -859,6 +928,10 @@ static void dv_std_ycc_hardware_off(void)
 	dv_std_ycc_reason = dv_std_ycc_enabled ? "idle" : "disabled";
 	dv_std_ycc_error = 0;
 	dv_std_ycc_handled_request = dv_std_ycc_request;
+	dv_std_ipt_active = false;
+	dv_std_ipt_reason = dv_std_ipt_enabled ? "idle" : "disabled";
+	dv_std_ipt_error = 0;
+	dv_std_ipt_handled_request = dv_std_ipt_request;
 	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
 }
 
@@ -1717,7 +1790,7 @@ static int dolby_core1_set
    bool dovi_src,
    bool reset,
    bool force_dm,
-   bool source_ycc,
+   bool direct_output,
    bool bypass_csc1)
 {
   u32 bypass_flag = 0;
@@ -1843,7 +1916,7 @@ static int dolby_core1_set
   if (!amdv_multi_dv_mode && (xbmc_dv_vp != 0) && (xbmc_dv_vp_tm == 3)) bypass_flag |= 1 << 1;
   if ((xbmc_dv_vp != 0) && (xbmc_dv_vp_tm > 1)) bypass_flag |= 1 << 2;
 
-  if (source_ycc) {
+  if (direct_output) {
     if (bypass_csc1)
       bypass_flag |= BIT(1); /* unit route: Composer YCC without source CSC */
     else
@@ -2008,7 +2081,7 @@ static int dolby_core2_set
    int hsize,
    int vsize,
    bool force_dm,
-   bool source_ycc,
+   bool direct_output,
    bool force_reset)
 {
   int i;
@@ -2086,15 +2159,15 @@ static int dolby_core2_set
   if (need_skip_cvm(1)) bypass_flag |= 1 << 0;
 
   if ((xbmc_dv_vp != 0) && (xbmc_dv_vp_tm > 1)) bypass_flag |= 1 << 0;
-  if (source_ycc) bypass_flag |= BIT(0);
+  if (direct_output) bypass_flag |= BIT(0);
 
   VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 2, 1);
   VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 1, 2 | bypass_flag);
   VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 1, 2 | bypass_flag);
   /* CTRL aliases REG_START+1. Keep the experimental CVM bypass in the final
    * writes too; clearing CTRL here otherwise silently restores native CVM. */
-  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, source_ycc ? BIT(0) : 0);
-  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, source_ycc ? BIT(0) : 0);
+  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, direct_output ? BIT(0) : 0);
+  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, direct_output ? BIT(0) : 0);
 
   /* may be set already but .... (from OSMC) TODO: whats at offset 23? */
   p_core2_dm_regs[23] = vsize << 16 | (hsize & 0xffff);
@@ -2324,7 +2397,7 @@ static int dolby_core3_set
    int scramble_en,
    u8 pps_state,
    bool force_dm,
-   int source_ycc_mode,
+   int direct_output_mode,
    bool force_reset)
 {
   int i;
@@ -2471,8 +2544,8 @@ static int dolby_core3_set
   {
     u32 core3_out_mode = cur_dv_mode;
 
-    if (source_ycc_mode >= 0)
-      core3_out_mode = source_ycc_mode;
+    if (direct_output_mode >= 0)
+      core3_out_mode = direct_output_mode;
     else if (amdv_multi_dv_mode &&
         dolby_vision_ll_policy == DOLBY_VISION_LL_DISABLE &&
         (cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL ||
@@ -3078,6 +3151,110 @@ static void dv_std_ycc_finish(const struct dv_std_ycc_submission *submit,
 	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
 }
 
+struct dv_std_ipt_submission {
+	bool active;
+	bool changed;
+	u32 request;
+	const char *reason;
+	int error;
+};
+
+/* Called after YCC prepare, which snapshots the common frame-matched source.
+ * Only private matrix bundles are changed. Output DM, scene metadata, Composer
+ * and both native LUT sets remain owned by the original algorithm. */
+static struct dv_std_ipt_submission dv_std_ipt_prepare(int enable,
+						       u32 hsize, u32 vsize,
+						       bool ycc_selected)
+{
+	struct dv_std_ipt_submission submit = {0};
+	struct dv_std_ipt_input in;
+	unsigned long flags;
+	bool requested, was_active, ycc_requested;
+	u32 epoch;
+
+	spin_lock_irqsave(&dv_std_ycc_lock, flags);
+	requested = dv_std_ipt_enabled;
+	was_active = dv_std_ipt_active;
+	ycc_requested = dv_std_ycc_enabled;
+	submit.request = dv_std_ipt_request;
+	epoch = dv_std_ycc_epoch;
+	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
+	submit.reason = "disabled";
+	if (!requested)
+		goto done;
+	submit.reason = "ycc_requested";
+	/* The earlier prepare may have selected YCC just before its sysfs
+	 * request was cleared. Never combine its metadata with direct IPT DM. */
+	if (ycc_requested || ycc_selected)
+		goto done;
+	submit.reason = "idle";
+	if (!enable || !hsize || !vsize)
+		goto done;
+	submit.reason = "mode";
+	if (!is_meson_sc2() || !amdv_multi_dv_mode || !p_funcs_new ||
+	    p_funcs_stb != p_funcs_new ||
+	    dolby_vision_mode != DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL ||
+	    dolby_vision_ll_policy != DOLBY_VISION_LL_DISABLE ||
+	    new_dovi_setting.src_format != FORMAT_DOVI ||
+	    new_dovi_setting.dst_format != FORMAT_DOVI ||
+	    new_dovi_setting.dovi_ll_enable || new_dovi_setting.diagnostic_enable ||
+	    is_dv_ll() || (dolby_vision_mask & 7) != 7)
+		goto done;
+	submit.reason = "debug_override";
+	if (dolby_vision_run_mode != 0xff || xbmc_dv_vp || force_update_reg ||
+	    READ_ONCE(dv_core3_test_rgb) ||
+	    (dolby_vision_flags & (FLAG_BYPASS_CSC | FLAG_BYPASS_CVM |
+		FLAG_CERTIFICAION | FLAG_SINGLE_STEP | FLAG_DISABLE_DMA_UPDATE |
+		FLAG_DISABLE_COMPOSER | FLAG_DISABE_CORE_SETTING)))
+		goto done;
+	submit.reason = "graphics_not_pq";
+	if (new_dovi_setting.g_format != G_HDR_RGB ||
+	    new_dovi_setting.g_bitdepth != 10)
+		goto done;
+	submit.reason = "source_unavailable";
+	if (!dv_std_ycc_source_work.valid || dv_std_ycc_source_work.epoch != epoch)
+		goto done;
+	memset(&in, 0, sizeof(in));
+	in.source_meta = dv_std_ycc_source_work.metadata;
+	in.source_len = dv_std_ycc_source_work.len;
+	in.output_meta = dv_std_ipt_output_metadata;
+	in.output_len = reverse_dv_meta(dv_std_ipt_output_metadata,
+				     &new_dovi_setting.md_reg3);
+	in.dm1 = (u32 *)&new_dovi_setting.dm_reg1;
+	in.dm2 = (u32 *)&new_dovi_setting.dm_reg2;
+	in.dm3 = (u32 *)&new_dovi_setting.dm_reg3;
+	in.core3_mode = DOLBY_CORE3_OUT_MODE_YCC_TUNNEL;
+	submit.error = dv_std_ipt_build(&in, &dv_std_ipt_work);
+	submit.reason = dv_std_ipt_result_name(submit.error);
+	if (submit.error)
+		goto done;
+	submit.reason = "source_changed";
+	if (epoch != dv_std_ycc_source_epoch() || !READ_ONCE(dolby_vision_enable))
+		goto done;
+	submit.active = true;
+	submit.reason = "active";
+done:
+	submit.changed = was_active != submit.active;
+	return submit;
+}
+
+static void dv_std_ipt_finish(const struct dv_std_ipt_submission *submit,
+			      unsigned int mask, bool programming_allowed)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dv_std_ycc_lock, flags);
+	if (programming_allowed && (!submit->changed || (mask & 7) == 7)) {
+		dv_std_ipt_active = submit->active;
+		dv_std_ipt_handled_request = submit->request;
+		dv_std_ipt_reason = submit->reason;
+		dv_std_ipt_error = submit->error;
+	} else {
+		dv_std_ipt_reason = "settings_blocked";
+	}
+	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
+}
+
 static void apply_stb_core_settings
   (int enable,
    unsigned int mask,
@@ -3094,6 +3271,7 @@ static void apply_stb_core_settings
   static u32 update_flag_more;
   int mute_type;
   struct dv_std_ycc_submission ycc;
+  struct dv_std_ipt_submission ipt;
   u32 *dm1 = (u32 *)&new_dovi_setting.dm_reg1;
   u32 *dm2 = (u32 *)&new_dovi_setting.dm_reg2;
   u32 *dm3 = (u32 *)&new_dovi_setting.dm_reg3;
@@ -3103,16 +3281,19 @@ static void apply_stb_core_settings
   if (h_size == 0xffff) h_size = 0;
   if (v_size == 0xffff) v_size = 0;
 
-  if (!vinfo && (READ_ONCE(dv_std_ycc_enabled) || READ_ONCE(dv_std_ycc_active))) {
+  if (!vinfo && (READ_ONCE(dv_std_ycc_enabled) || READ_ONCE(dv_std_ycc_active) ||
+                 READ_ONCE(dv_std_ipt_enabled) || READ_ONCE(dv_std_ipt_active))) {
     unsigned long flags;
 
     spin_lock_irqsave(&dv_std_ycc_lock, flags);
     dv_std_ycc_reason = "no_output";
+    dv_std_ipt_reason = "no_output";
     spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
     return;
   }
 
   ycc = dv_std_ycc_prepare(enable, h_size, v_size);
+  ipt = dv_std_ipt_prepare(enable, h_size, v_size, ycc.active);
   if (ycc.active) {
     dm1 = dv_std_ycc_work.dm1;
     dm2 = dv_std_ycc_work.dm2;
@@ -3121,11 +3302,16 @@ static void apply_stb_core_settings
   } else if (ycc.native_refresh) {
     md3 = &dv_std_ycc_private_md;
   }
+  if (ipt.active) {
+    dm1 = dv_std_ipt_work.dm1;
+    dm2 = dv_std_ipt_work.dm2;
+    dm3 = dv_std_ipt_work.dm3;
+  }
   /* A basis transition is one joint submission, including native restoration.
    * force_dm avoids comparisons against the deliberately native last_dm cache;
    * it never requests a per-frame reset or LUT upload. */
-  force_dm = ycc.active || ycc.changed;
-  if (ycc.changed) {
+  force_dm = ycc.active || ycc.changed || ipt.active || ipt.changed;
+  if (ycc.changed || ipt.changed) {
     mask |= 7;
     reset = true;
   }
@@ -3170,7 +3356,7 @@ static void apply_stb_core_settings
           new_dovi_setting.src_format == FORMAT_DOVI,
           reset,
           force_dm,
-          ycc.active,
+          ycc.active || ipt.active,
           ycc.active && dv_std_ycc_work.bypass_csc1);
     }
   }
@@ -3192,8 +3378,8 @@ static void apply_stb_core_settings
         graphics_w,
         graphics_h,
         force_dm,
-        ycc.active,
-        ycc.changed);
+        ycc.active || ipt.active,
+        ycc.changed || ipt.changed);
   }
 
   if (mask & 4) { // Core 3
@@ -3232,11 +3418,13 @@ static void apply_stb_core_settings
         (dolby_vision_mode == DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL),
         pps_state,
         force_dm,
-        ycc.active ? (int)dv_std_ycc_work.core3_mode : -1,
-        ycc.changed);
+        ycc.active ? (int)dv_std_ycc_work.core3_mode :
+          ipt.active ? (int)dv_std_ipt_work.core3_mode : -1,
+        ycc.changed || ipt.changed);
   }
 
   dv_std_ycc_finish(&ycc, mask, programming_allowed);
+  dv_std_ipt_finish(&ipt, mask, programming_allowed);
 
   stb_core_setting_update_flag = 0;
   update_flag_more = update_bk;
@@ -7680,7 +7868,8 @@ int dolby_vision_process(struct vframe_s *vf,
 		return -1;
 
 	stb_vd1_display_size = display_size;
-	if (READ_ONCE(dv_std_ycc_request) != READ_ONCE(dv_std_ycc_handled_request))
+	if (READ_ONCE(dv_std_ycc_request) != READ_ONCE(dv_std_ycc_handled_request) ||
+	    READ_ONCE(dv_std_ipt_request) != READ_ONCE(dv_std_ipt_handled_request))
 		dolby_vision_set_toggle_flag(1);
 
 	if (dolby_vision_flags & FLAG_CERTIFICAION) {
@@ -7872,7 +8061,7 @@ int dolby_vision_process(struct vframe_s *vf,
 		/* This branch can return without the normal all-core apply. Restore
 		 * the cached native colour basis before its existing SDR delay/stop
 		 * logic; an eventual hardware-off also invalidates the source. */
-		if (READ_ONCE(dv_std_ycc_active) && vinfo)
+		if ((READ_ONCE(dv_std_ycc_active) || READ_ONCE(dv_std_ipt_active)) && vinfo)
 			apply_stb_core_settings(dovi_setting_video_flag, 7, true,
 				(dovi_setting.video_width << 16) | dovi_setting.video_height,
 				pps_state);
@@ -7948,7 +8137,7 @@ int dolby_vision_process(struct vframe_s *vf,
 		video_effect_bypass(1);
 
 	if (!p_funcs_stb) {
-		if (READ_ONCE(dv_std_ycc_active) && vinfo)
+		if ((READ_ONCE(dv_std_ycc_active) || READ_ONCE(dv_std_ipt_active)) && vinfo)
 			apply_stb_core_settings(dovi_setting_video_flag, 7, true,
 				(dovi_setting.video_width << 16) | dovi_setting.video_height,
 				pps_state);
