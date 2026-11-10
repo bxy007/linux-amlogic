@@ -71,6 +71,8 @@
 #include "dv_hdr10_encoding.h"
 #include "dv_std_ycc.h"
 #include "dv_std_ipt.h"
+#include "std_ipt_cvm/cvm.h"
+#include "std_ipt_cvm/metadata-policy.h"
 
 DEFINE_SPINLOCK(dovi_lock);
 
@@ -761,6 +763,10 @@ struct dv_std_ycc_source_cache {
 	u32 index;
 	u64 pts;
 	u32 len;
+	/* Effective public control_path GUI arguments, captured with this source. */
+	u32 graphic_min_10000;
+	u32 graphic_max_nits;
+	u32 graphics_priority;
 	u8 metadata[DV_STD_YCC_META_MAX];
 };
 
@@ -787,6 +793,21 @@ static int dv_std_ipt_error;
 static const char *dv_std_ipt_reason = "disabled";
 static struct dv_std_ipt_setting dv_std_ipt_work;
 static u8 dv_std_ipt_output_metadata[DV_STD_YCC_META_MAX];
+static u8 dv_std_ipt_policy_metadata[DV_STD_YCC_META_MAX];
+static u8 dv_std_ipt_last_metadata[DV_STD_YCC_META_MAX];
+static u32 dv_std_ipt_policy_metadata_len;
+static u32 dv_std_ipt_last_metadata_len;
+static bool dv_std_ipt_last_metadata_valid;
+static struct md_reg_ipcore3 dv_std_ipt_private_md;
+static struct dvm24_output_info dv_std_ipt_policy_info;
+static bool dv_std_ipt_metadata_edited;
+static u16 dv_std_ipt_l1_in[3], dv_std_ipt_l1_out[3];
+static struct dv_stb24_cvm dv_std_ipt_gui_cvm;
+static bool dv_std_ipt_cvm_active;
+static bool dv_std_ipt_hw_lut_valid;
+static bool dv_std_ipt_hw_cvm_active;
+static struct dm_lut_ipcore dv_std_ipt_hw_lut;
+static u64 dv_std_ipt_cvm_uploads;
 
 static int dv_std_ipt_enable_set(const char *val, const struct kernel_param *kp)
 {
@@ -819,11 +840,22 @@ static int dv_std_ipt_status_get(char *buf, const struct kernel_param *kp)
 
 	spin_lock_irqsave(&dv_std_ycc_lock, flags);
 	len = scnprintf(buf, PAGE_SIZE,
-		"experimental=1 gui_qualified=0 route=direct_ipt enabled=%u active=%u reason=%s error=%d request=%u handled=%u epoch=%u source=%llu\n",
+		"experimental=1 gui_qualified=0 route=direct_ipt enabled=%u active=%u reason=%s error=%d request=%u handled=%u epoch=%u source=%llu cvm=%u cvm_reason=%s cvm_error=%d cvm_builds=%llu cvm_hits=%llu cvm_uploads=%llu cvm_us=%u cvm_max_us=%u policy=stb24_vpri metadata_unchanged=%u l1_in=%u:%u:%u l1_out=%u:%u:%u\n",
 		dv_std_ipt_enabled, dv_std_ipt_active, dv_std_ipt_reason,
 		dv_std_ipt_error, dv_std_ipt_request, dv_std_ipt_handled_request,
 		dv_std_ycc_epoch,
-		(unsigned long long)dv_std_ycc_committed_source.serial);
+		(unsigned long long)dv_std_ycc_committed_source.serial,
+		dv_std_ipt_cvm_active,
+		READ_ONCE(dv_std_ipt_gui_cvm.reason) ?: "idle",
+		READ_ONCE(dv_std_ipt_gui_cvm.detail),
+		(unsigned long long)READ_ONCE(dv_std_ipt_gui_cvm.builds),
+		(unsigned long long)READ_ONCE(dv_std_ipt_gui_cvm.hits),
+		(unsigned long long)READ_ONCE(dv_std_ipt_cvm_uploads),
+		READ_ONCE(dv_std_ipt_gui_cvm.last_us),
+		READ_ONCE(dv_std_ipt_gui_cvm.max_us),
+		!(dv_std_ipt_active && dv_std_ipt_metadata_edited),
+		dv_std_ipt_l1_in[0], dv_std_ipt_l1_in[1], dv_std_ipt_l1_in[2],
+		dv_std_ipt_l1_out[0], dv_std_ipt_l1_out[1], dv_std_ipt_l1_out[2]);
 	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
 	return len;
 }
@@ -929,6 +961,11 @@ static void dv_std_ycc_hardware_off(void)
 	dv_std_ycc_error = 0;
 	dv_std_ycc_handled_request = dv_std_ycc_request;
 	dv_std_ipt_active = false;
+	dv_std_ipt_cvm_active = false;
+	dv_std_ipt_hw_lut_valid = false;
+	dv_std_ipt_hw_cvm_active = false;
+	dv_std_ipt_last_metadata_valid = false;
+	dv_std_ipt_metadata_edited = false;
 	dv_std_ipt_reason = dv_std_ipt_enabled ? "idle" : "disabled";
 	dv_std_ipt_error = 0;
 	dv_std_ipt_handled_request = dv_std_ipt_request;
@@ -940,7 +977,8 @@ static void dv_std_ycc_hardware_off(void)
  */
 static void dv_std_ycc_latch_source(struct vframe_s *vf, u32 epoch,
 				   const u8 *metadata, u32 len,
-				   bool source_dovi)
+				   bool source_dovi, u32 graphic_min,
+				   u32 graphic_max, u32 priority)
 {
 	struct dv_std_ycc_source_cache *s = &dv_std_ycc_pending_source;
 	unsigned long flags;
@@ -967,6 +1005,11 @@ static void dv_std_ycc_latch_source(struct vframe_s *vf, u32 epoch,
 			s->present = true;
 			s->serial = serial;
 		}
+	}
+	if (s->valid) {
+		s->graphic_min_10000 = graphic_min;
+		s->graphic_max_nits = graphic_max;
+		s->graphics_priority = priority;
 	}
 	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
 }
@@ -2082,6 +2125,7 @@ static int dolby_core2_set
    int vsize,
    bool force_dm,
    bool direct_output,
+   bool direct_cvm,
    bool force_reset)
 {
   int i;
@@ -2159,15 +2203,16 @@ static int dolby_core2_set
   if (need_skip_cvm(1)) bypass_flag |= 1 << 0;
 
   if ((xbmc_dv_vp != 0) && (xbmc_dv_vp_tm > 1)) bypass_flag |= 1 << 0;
-  if (direct_output) bypass_flag |= BIT(0);
+  if (direct_output && !direct_cvm) bypass_flag |= BIT(0);
 
   VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 2, 1);
   VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 1, 2 | bypass_flag);
   VSYNC_WR_DV_REG(DOLBY_CORE2A_REG_START + 1, 2 | bypass_flag);
-  /* CTRL aliases REG_START+1. Keep the experimental CVM bypass in the final
-   * writes too; clearing CTRL here otherwise silently restores native CVM. */
-  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, direct_output ? BIT(0) : 0);
-  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, direct_output ? BIT(0) : 0);
+  /* A direct matrix route may use its matching private graphics curve.
+   * Never re-enable native curves in the new basis as an incidental CTRL write.
+   */
+  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, direct_output && !direct_cvm ? BIT(0) : 0);
+  VSYNC_WR_DV_REG(DOLBY_CORE2A_CTRL, direct_output && !direct_cvm ? BIT(0) : 0);
 
   /* may be set already but .... (from OSMC) TODO: whats at offset 23? */
   p_core2_dm_regs[23] = vsize << 16 | (hsize & 0xffff);
@@ -2193,6 +2238,15 @@ static int dolby_core2_set
   if (amdv_multi_dv_mode && set_lut && !reset &&
       !memcmp(p_core2_lut, &dovi_setting.dm_lut2, sizeof(dovi_setting.dm_lut2)))
     set_lut = false;
+
+  /* Native TC2 flags/caches describe native tables only. While the private
+   * curve is selected (or being restored), compare against what was actually
+   * uploaded; CONST_TC2 must neither suppress a new candidate nor cause an
+   * unchanged candidate to be re-uploaded on every video frame.
+   */
+  if (direct_cvm || dv_std_ipt_hw_cvm_active)
+    set_lut = !dv_std_ipt_hw_lut_valid ||
+      memcmp(p_core2_lut, &dv_std_ipt_hw_lut, sizeof(dv_std_ipt_hw_lut));
 
   if (unlikely(dv_lut_dbg)) {
     bool lut2_changed = !reset &&
@@ -2226,6 +2280,11 @@ static int dolby_core2_set
       VSYNC_WR_DV_REG(DOLBY_CORE2A_DMA_PORT, p_core2_lut[i]);
     }
 
+    memcpy(&dv_std_ipt_hw_lut, p_core2_lut, sizeof(dv_std_ipt_hw_lut));
+    dv_std_ipt_hw_lut_valid = true;
+    if (direct_cvm)
+      dv_std_ipt_cvm_uploads++;
+
     /* core2 lookup table program done */
 
     if (is_meson_gxm() && (dolby_vision_flags & FLAG_CLKGATE_WHEN_LOAD_LUT))
@@ -2233,6 +2292,7 @@ static int dolby_core2_set
 
   }
   force_set_lut = false;
+  dv_std_ipt_hw_cvm_active = direct_cvm;
 
   /* enable core2 */
   VSYNC_WR_DV_REG(DOLBY_CORE2A_SWAP_CTRL0, 1);
@@ -3154,14 +3214,26 @@ static void dv_std_ycc_finish(const struct dv_std_ycc_submission *submit,
 struct dv_std_ipt_submission {
 	bool active;
 	bool changed;
+	bool cvm_active;
+	bool metadata_changed;
+	bool metadata_edited;
+	bool native_refresh;
 	u32 request;
 	const char *reason;
 	int error;
 };
 
+static bool dv_std_ipt_same_metadata(const u8 *a, const u8 *b, u32 len)
+{
+	/* Scene-refresh is a notification, not an input to the mapping policy. */
+	return len >= ETSI_META_OFFSET && a[0] == b[0] &&
+		!memcmp(a + 2, b + 2, len - 2);
+}
+
 /* Called after YCC prepare, which snapshots the common frame-matched source.
- * Only private matrix bundles are changed. Output DM, scene metadata, Composer
- * and both native LUT sets remain owned by the original algorithm. */
+ * Matrices, GUI curves and the coupled transmitted packet are private.
+ * Composer and original algorithm settings/LUT caches are never overwritten.
+ */
 static struct dv_std_ipt_submission dv_std_ipt_prepare(int enable,
 						       u32 hsize, u32 vsize,
 						       bool ycc_selected)
@@ -3170,7 +3242,7 @@ static struct dv_std_ipt_submission dv_std_ipt_prepare(int enable,
 	struct dv_std_ipt_input in;
 	unsigned long flags;
 	bool requested, was_active, ycc_requested;
-	u32 epoch;
+	u32 epoch, sink_dm_version;
 
 	spin_lock_irqsave(&dv_std_ycc_lock, flags);
 	requested = dv_std_ipt_enabled;
@@ -3231,10 +3303,80 @@ static struct dv_std_ipt_submission dv_std_ipt_prepare(int enable,
 	submit.reason = "source_changed";
 	if (epoch != dv_std_ycc_source_epoch() || !READ_ONCE(dolby_vision_enable))
 		goto done;
+	/* Both the private curve and its output metadata are derived from this
+	 * frame's original source, never from a previous adjusted output L1.
+	 * Any unsupported part rejects the entire direct bundle.
+	 */
+	submit.reason = "sink_metadata_version";
+	submit.error = dvm24_sink_version(new_dovi_setting.vsvdb_tbl,
+		new_dovi_setting.vsvdb_len, &sink_dm_version);
+	if (submit.error)
+		goto done;
+	if (dv_std_ycc_source_work.graphic_max_nits &&
+	    dv_std_ycc_source_work.graphic_max_nits <= 1000 &&
+	    dv_std_ycc_source_work.graphic_min_10000 <
+	      dv_std_ycc_source_work.graphic_max_nits * 10000) {
+		u32 min_q18 = (u32)div64_u64(
+			(u64)dv_std_ycc_source_work.graphic_min_10000 * 262144, 10000);
+		u32 max_q18 = dv_std_ycc_source_work.graphic_max_nits * 262144;
+
+		submit.error = dv_stb24_cvm_update_source(&dv_std_ipt_gui_cvm,
+			in.source_meta, in.source_len, min_q18, max_q18,
+			dv_std_ycc_source_work.graphics_priority);
+		submit.reason = dv_std_ipt_gui_cvm.reason;
+		if (submit.error)
+			goto done;
+	} else {
+		dv_std_ipt_gui_cvm.valid = false;
+		dv_std_ipt_gui_cvm.reason = "gui_range";
+		dv_std_ipt_gui_cvm.detail = -ERANGE;
+		submit.reason = "gui_range";
+		submit.error = -ERANGE;
+		goto done;
+	}
+	submit.reason = "metadata_policy";
+	submit.error = dvm24_output_policy(in.source_meta, in.source_len,
+		in.output_meta, in.output_len, dv_std_ipt_gui_cvm.control,
+		sink_dm_version, dv_std_ipt_policy_metadata,
+		&dv_std_ipt_policy_metadata_len, &dv_std_ipt_policy_info);
+	if (submit.error)
+		goto done;
+	submit.metadata_edited = in.output_len != dv_std_ipt_policy_metadata_len ||
+		memcmp(in.output_meta, dv_std_ipt_policy_metadata, in.output_len);
+	submit.metadata_changed = !was_active || !dv_std_ipt_last_metadata_valid ||
+		dv_std_ipt_last_metadata_len != dv_std_ipt_policy_metadata_len ||
+		!dv_std_ipt_same_metadata(dv_std_ipt_last_metadata,
+			dv_std_ipt_policy_metadata, dv_std_ipt_policy_metadata_len);
+	if (submit.metadata_changed)
+		dv_std_ipt_policy_metadata[1] = 1;
+	memset(&dv_std_ipt_private_md, 0, sizeof(dv_std_ipt_private_md));
+	prepare_dv_meta(&dv_std_ipt_private_md, dv_std_ipt_policy_metadata,
+			dv_std_ipt_policy_metadata_len);
+	if (epoch != dv_std_ycc_source_epoch() || !READ_ONCE(dolby_vision_enable)) {
+		submit.reason = "source_changed";
+		goto done;
+	}
 	submit.active = true;
+	submit.cvm_active = true;
 	submit.reason = "active";
+	dv_std_ipt_work.bypass_cvm2 = false;
 done:
 	submit.changed = was_active != submit.active;
+	if (!submit.active && was_active) {
+		u32 len = reverse_dv_meta(dv_std_ipt_output_metadata,
+					&new_dovi_setting.md_reg3);
+
+		/* Restore the native mapping as a new scene even on a paused frame.
+		 * This notification is private; the native setting remains intact.
+		 */
+		if (dv_std_ycc_native_metadata_valid(dv_std_ipt_output_metadata, len)) {
+			dv_std_ipt_output_metadata[1] = 1;
+			memset(&dv_std_ipt_private_md, 0, sizeof(dv_std_ipt_private_md));
+			prepare_dv_meta(&dv_std_ipt_private_md,
+				dv_std_ipt_output_metadata, len);
+			submit.native_refresh = true;
+		}
+	}
 	return submit;
 }
 
@@ -3246,6 +3388,20 @@ static void dv_std_ipt_finish(const struct dv_std_ipt_submission *submit,
 	spin_lock_irqsave(&dv_std_ycc_lock, flags);
 	if (programming_allowed && (!submit->changed || (mask & 7) == 7)) {
 		dv_std_ipt_active = submit->active;
+		dv_std_ipt_cvm_active = submit->active && submit->cvm_active;
+		dv_std_ipt_metadata_edited = submit->active && submit->metadata_edited;
+		if (submit->active) {
+			memcpy(dv_std_ipt_last_metadata, dv_std_ipt_policy_metadata,
+			       dv_std_ipt_policy_metadata_len);
+			dv_std_ipt_last_metadata_len = dv_std_ipt_policy_metadata_len;
+			dv_std_ipt_last_metadata_valid = true;
+			memcpy(dv_std_ipt_l1_in, dv_std_ipt_policy_info.input_l1,
+			       sizeof(dv_std_ipt_l1_in));
+			memcpy(dv_std_ipt_l1_out, dv_std_ipt_policy_info.output_l1,
+			       sizeof(dv_std_ipt_l1_out));
+		} else {
+			dv_std_ipt_last_metadata_valid = false;
+		}
 		dv_std_ipt_handled_request = submit->request;
 		dv_std_ipt_reason = submit->reason;
 		dv_std_ipt_error = submit->error;
@@ -3306,6 +3462,9 @@ static void apply_stb_core_settings
     dm1 = dv_std_ipt_work.dm1;
     dm2 = dv_std_ipt_work.dm2;
     dm3 = dv_std_ipt_work.dm3;
+    md3 = &dv_std_ipt_private_md;
+  } else if (ipt.native_refresh && !ycc.active && !ycc.native_refresh) {
+    md3 = &dv_std_ipt_private_md;
   }
   /* A basis transition is one joint submission, including native restoration.
    * force_dm avoids comparisons against the deliberately native last_dm cache;
@@ -3315,6 +3474,10 @@ static void apply_stb_core_settings
     mask |= 7;
     reset = true;
   }
+  if (ipt.active && (ipt.metadata_changed ||
+                    ipt.cvm_active != READ_ONCE(dv_std_ipt_cvm_active) ||
+                    (ipt.cvm_active && dv_std_ipt_gui_cvm.changed)))
+    mask |= 6;
   programming_allowed = !(dolby_vision_on &&
     (dolby_vision_flags & FLAG_DISABE_CORE_SETTING));
 
@@ -3372,13 +3535,21 @@ static void apply_stb_core_settings
     if (stb_core2_const_flag)
       memcpy(&new_dovi_setting.dm_lut2, &dovi_setting.dm_lut2, sizeof(struct dm_lut_ipcore));
 
+    /* Preserve the exact current native PQ/G2L block; only the four curve
+     * tables come from the private neutral-profile generator.
+     */
+    if (ipt.active && ipt.cvm_active)
+      memcpy(dv_std_ipt_gui_cvm.lut + 1024,
+             ((u32 *)&new_dovi_setting.dm_lut2) + 1024, 256 * sizeof(u32));
     dolby_core2_set(
         dm2,
-        (u32 *)&new_dovi_setting.dm_lut2,
+        ipt.active && ipt.cvm_active ? dv_std_ipt_gui_cvm.lut :
+          (u32 *)&new_dovi_setting.dm_lut2,
         graphics_w,
         graphics_h,
         force_dm,
         ycc.active || ipt.active,
+        ipt.active && ipt.cvm_active,
         ycc.changed || ipt.changed);
   }
 
@@ -7484,7 +7655,8 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 		dovi_setting_video_flag = video_frame;
 		dv_std_ycc_latch_source(vf, ycc_parse_epoch,
 			md_buf[current_id], md_size_use,
-			src_format == FORMAT_DOVI && dst_format == FORMAT_DOVI);
+			src_format == FORMAT_DOVI && dst_format == FORMAT_DOVI,
+			graphic_min, graphic_max, pri_mode);
 
 		if (debug_dolby & 1)
 		{

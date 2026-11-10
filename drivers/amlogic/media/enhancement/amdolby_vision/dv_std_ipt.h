@@ -11,7 +11,8 @@
  * GUI:   Ag' = At * inv(native video A2B) * native GUI A2B.
  * At already includes source M2: another source-RPU correction is WRONG.
  * GUI rebase covers only the linear basis, not CVM/PMA/alpha qualification.
- * Both CVMs must be bypassed; retaining native GUI CVM is not equivalent.
+ * The matrix-only bundle bypasses both CVMs. A caller may separately provide
+ * a matching private GUI curve; retaining native GUI CVM is not equivalent.
  * GUI RGB is assumed <= 1000 nits (linear <= 0.1 of the PQ 10000-nit unit).
  * A <= 1+1/1024 GUI row gain retains native coefficient rounding, with ample
  * headroom at that peak. This is NOT a full-10000-nit GUI clipping guarantee.
@@ -71,7 +72,7 @@ struct dv_std_ipt_setting {
 	u32 core3_mode;
 	bool bypass_csc1;
 	bool bypass_cvm1;
-	bool bypass_cvm2;
+	bool bypass_cvm2; /* Default for this builder; private GUI CVM may replace it. */
 	bool gui_rebased; /* Geometric rebase only; NOT GUI display qualification. */
 };
 
