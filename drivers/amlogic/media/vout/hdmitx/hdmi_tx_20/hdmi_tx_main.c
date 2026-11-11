@@ -77,6 +77,10 @@
 #define HDMI_TX_PWR_CTRL_NUM	6
 
 static struct class *hdmitx_class;
+/* Applied DV format constraint: 0 = none, tunnel + 1, -1 = invalid.
+ * Zero preserves the non-DV bootloader handoff until the first mode set.
+ */
+static int backup_dv_transport;
 static int set_disp_mode_auto(void);
 static void hdmitx_get_edid(struct hdmitx_dev *hdev);
 static void hdmitx_set_drm_pkt(struct master_display_info_s *data);
@@ -427,6 +431,7 @@ static  int  set_disp_mode(const char *mode)
 	struct hdmi_format_para *para = NULL;
 	struct hdmitx_dev *hdev = &hdmitx_device;
 
+	backup_dv_transport = -1;
 	para = hdmi_get_fmt_name(mode, hdev->fmt_attr);
 	hdev->para = para;
 
@@ -614,6 +619,22 @@ module_param(hdmi_sinkprobe_ms, uint, 0644);
 MODULE_PARM_DESC(hdmi_sinkprobe_ms,
 	"\n diag: ms after a mode set to log sink link state, 0 = off. 1 = passive fields only, >1 also reads rxsense which ARMS THE PHY SENSE COMPARATOR (writes PHY_CNTL0/3)\n");
 
+/* DV can force a different wire format without changing the requested attr.
+ * Keep DV_AHEAD and its final VSIF equivalent, and leave non-DV metadata
+ * changes out of the mode cache: neither requires another format setup.
+ */
+static int hdmitx_dv_transport(enum eotf_type eotf, enum mode_type tunnel)
+{
+	switch (eotf) {
+	case EOTF_T_DOLBYVISION:
+	case EOTF_T_LL_MODE:
+	case EOTF_T_DV_AHEAD:
+		return tunnel + 1;
+	default:
+		return 0;
+	}
+}
+
 static int set_disp_mode_auto(void)
 {
 	int ret =  -1;
@@ -625,8 +646,13 @@ static int set_disp_mode_auto(void)
 	enum hdmi_vic vic = HDMI_Unknown;
 	int colour_depths[] = { 8, 10, 12, 16 };
 	char* colour_sampling[] = {"RGB","YUV422","YUV444","YUV420"};
+	enum eotf_type eotf = READ_ONCE(hdev->hdmi_current_eotf_type);
+	enum mode_type tunnel = READ_ONCE(hdev->hdmi_current_tunnel_mode);
+	int dv_transport = hdmitx_dv_transport(eotf, tunnel);
 
 	memset(mode, 0, sizeof(mode));
+	/* Early returns and failed mode sets must not cache an unapplied format. */
+	backup_dv_transport = -1;
 	hdev->ready = 0;
 	hdmitx_hdr_to_sdr_flush();
 
@@ -694,13 +720,13 @@ static int set_disp_mode_auto(void)
 	if (xbmc_aml_linux_force_422) para->cs = COLORSPACE_YUV422;
 
 	// force colour subsampling when DV mode
-	switch (hdev->hdmi_current_eotf_type) {
+	switch (eotf) {
 		case EOTF_T_DOLBYVISION:
 		case EOTF_T_LL_MODE:
 		case EOTF_T_DV_AHEAD:
 			{
 				int cs = para->cs;
-				switch (hdev->hdmi_current_tunnel_mode) {
+				switch (tunnel) {
 					case RGB_8BIT:
 					case RGB_10_12BIT:
 						para->cs = COLORSPACE_YUV444;
@@ -727,14 +753,14 @@ static int set_disp_mode_auto(void)
 
 	// parse and set maximum colourdepth given by edid
 	// check for colour subsampling limit
-	switch (hdev->hdmi_current_eotf_type) {
+	switch (eotf) {
 		case EOTF_T_DOLBYVISION:
 		case EOTF_T_LL_MODE:
 		case EOTF_T_DV_AHEAD:
 			{
 				const struct dv_info *dv_info = &hdev->rxcap.dv_info;
 				int cd = para->cd;
-				switch (hdev->hdmi_current_tunnel_mode) {
+				switch (tunnel) {
 					case RGB_8BIT:
 							para->cd = COLORDEPTH_24B;
 						break;
@@ -840,10 +866,10 @@ static int set_disp_mode_auto(void)
 	/* nothing */
 	}
 
-	pr_info(SYS "setting mode %s vic %d cs %d cd %d frac %d attr %s\n",
+	pr_info(SYS "setting mode %s vic %d cs %d cd %d frac %d attr %s dv_transport %d\n",
 		mode, vic, hdev->para ? hdev->para->cs : -1,
 		hdev->para ? hdev->para->cd : -1,
-		hdev->frac_rate_policy, hdev->fmt_attr);
+		hdev->frac_rate_policy, hdev->fmt_attr, dv_transport);
 
 	hdmitx_pre_display_init();
 
@@ -888,10 +914,13 @@ static int set_disp_mode_auto(void)
 		pr_info(SYS "mode %s not set, phy left disabled, ret %d\n",
 			mode, ret);
 	edidinfo_attach_to_vinfo(hdev);
-	/* backup values need to be updated to latest values */
-	memcpy(hdev->backup_fmt_attr, hdev->fmt_attr, 16);
-	hdev->backup_frac_rate_policy = hdev->frac_rate_policy;
-	hdev->backup_phy_idx = hdev->phy_idx;
+	/* Cache only the constraints actually used for a successful mode set. */
+	if (ret >= 0) {
+		memcpy(hdev->backup_fmt_attr, hdev->fmt_attr, 16);
+		hdev->backup_frac_rate_policy = hdev->frac_rate_policy;
+		hdev->backup_phy_idx = hdev->phy_idx;
+		backup_dv_transport = dv_transport;
+	}
 	return ret;
 }
 
@@ -6179,6 +6208,7 @@ static int hdmitx_module_disable(enum vmode_e cur_vmod)
 {
 	struct hdmitx_dev *hdev = &hdmitx_device;
 
+	backup_dv_transport = -1;
 	hdev->hwop.cntlconfig(hdev, CONF_CLR_AVI_PACKET, 0);
 	hdev->hwop.cntlconfig(hdev, CONF_CLR_VSDB_PACKET, 0);
 	hdev->hwop.cntlmisc(hdev, MISC_TMDS_PHY_OP, TMDS_PHY_DISABLE);
@@ -6230,7 +6260,10 @@ static int hdmitx_check_same_vmodeattr(char *name)
 
 	if ((memcmp(hdev->backup_fmt_attr, hdev->fmt_attr, 16) == 0) &&
 	    (hdev->backup_frac_rate_policy == hdev->frac_rate_policy) &&
-	    (hdev->backup_phy_idx == hdev->phy_idx))
+	    (hdev->backup_phy_idx == hdev->phy_idx) &&
+	    (backup_dv_transport == hdmitx_dv_transport(
+		READ_ONCE(hdev->hdmi_current_eotf_type),
+		READ_ONCE(hdev->hdmi_current_tunnel_mode))))
 		return 1;
 	return 0;
 }
