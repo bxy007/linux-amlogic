@@ -33,8 +33,12 @@
 #include <linux/sched.h>
 #include <linux/smp.h>
 #include <linux/delay.h>
+#include <linux/string.h>
 #ifdef CONFIG_AMLOGIC_CPU_INFO
 #include <linux/amlogic/cpu_version.h>
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+#include <linux/amlogic/media/amdolbyvision/dolby_vision.h>
+#endif
 #endif
 
 
@@ -147,11 +151,13 @@ static int c_show(struct seq_file *m, void *v)
 		{ "962E", MESON_CPU_MAJOR_ID_TXLX, 0x20, 0xf0 },
 		{ "A113X", MESON_CPU_MAJOR_ID_AXG, 0x37, 0xff },
 		{ "A113D", MESON_CPU_MAJOR_ID_AXG, 0x22, 0xff },
+		{ "S905X2", MESON_CPU_MAJOR_ID_G12A, 0x00, 0xf0 },
 		{ "S905D2", MESON_CPU_MAJOR_ID_G12A, 0x10, 0xf0 },
 		{ "S905X2", MESON_CPU_MAJOR_ID_G12A, 0x40, 0xf0 },
 		{ "S905Y2", MESON_CPU_MAJOR_ID_G12A, 0x30, 0xf0 },
 		{ "S922X", MESON_CPU_MAJOR_ID_G12B, 0x40, 0xf0 },
 		{ "S922Z", MESON_CPU_MAJOR_ID_G12B, 0x70, 0xf0 },
+		{ "S922Z-2", MESON_CPU_MAJOR_ID_G12B, 0x00, 0xf0 },
 		{ "A311D", MESON_CPU_MAJOR_ID_G12B, 0x10, 0xf0 },
 		{ "S905X3", MESON_CPU_MAJOR_ID_SM1, 0x01, 0x0f },
 		{ "S905X3", MESON_CPU_MAJOR_ID_SM1, 0x10, 0xf0 },
@@ -227,6 +233,11 @@ static int c_show(struct seq_file *m, void *v)
 				(meson_pack & meson_packages[i].pack_mask))
 			meson_name = meson_packages[i].name;
 	}
+#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+	/* Bits 0-2 indicate a license, a registered module, and valid status. */
+	if (!strcmp(meson_name, "A311D") && (get_dv_support_info() & 7) == 7)
+		meson_name = "A311D-K";
+#endif
 	seq_printf(m, "model name\t: Amlogic %s rev %01x\n", meson_name, meson_minor);
 #endif
 	seq_printf(m, "Hardware\t: %s\n\n", machine_name);
