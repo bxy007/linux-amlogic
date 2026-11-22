@@ -28,6 +28,7 @@
 #include <linux/device.h>
 #include <linux/clk.h>
 #include <linux/workqueue.h>
+#include <linux/completion.h>
 
 /* Amlogic Headers */
 #include <linux/amlogic/cpu_version.h>
@@ -42,6 +43,7 @@
 #include <linux/amlogic/media/rdma/rdma_mgr.h>
 #endif
 
+#ifdef CONFIG_AMLOGIC_UVM_CORE
 /* v4l2 header */
 #include <media/v4l2-common.h>
 #include <linux/videodev2.h>
@@ -54,12 +56,15 @@
 #include <media/v4l2-event.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-dma-contig.h>
+#endif
 
 /* Local Headers */
 #include "../tvin_frontend.h"
 #include "vdin_vf.h"
 #include "vdin_regs.h"
+#ifdef CONFIG_AMLOGIC_UVM_CORE
 #include "vdin_v4l2_if.h"
+#endif
 
 /* Ref.2019/04/25: tl1 vdin0 afbce dynamically switch support,
  *                 vpp also should support this function
@@ -662,7 +667,7 @@ struct vdin_dev_s {
 
 	/*v4l interface ---- start*/
 	enum vdin_work_mode_e work_mode;
-
+#ifdef CONFIG_AMLOGIC_UVM_CORE
 	struct v4l2_device v4l2_dev;
 	struct video_device vdev;
 	struct vb2_queue vbqueue;
@@ -679,7 +684,16 @@ struct vdin_dev_s {
 	unsigned int dbg_v4l_done_cnt;
 	unsigned int dbg_v4l_que_cnt;
 	unsigned int dbg_v4l_dque_cnt;
+#endif
 	/*v4l interface ---- end*/
+
+	/* single-frame on-demand snapshot state (vdin1) */
+	bool raw_capture;
+	bool snap_active;
+	unsigned int snap_stage;
+	unsigned int snap_irq_cnt;
+	int snap_err;
+	struct completion snap_done;
 
 	unsigned int tx_fmt;
 	unsigned int vd1_fmt;
@@ -768,9 +782,28 @@ struct vdin_dev_s *vdin_get_dev(unsigned int index);
 void vdin_mif_config_init(struct vdin_dev_s *devp);
 void vdin_drop_frame_info(struct vdin_dev_s *devp, char *info);
 
+#ifdef CONFIG_AMLOGIC_UVM_CORE
 int vdin_v4l2_probe(struct platform_device *pdev,
 		    struct vdin_dev_s *vdindevp);
 int vdin_v4l2_if_isr(struct vdin_dev_s *pdev, struct vframe_s *vfp);
+#else
+static inline int vdin_v4l2_probe(struct platform_device *pdev,
+				  struct vdin_dev_s *vdindevp)
+{
+	return 0;
+}
+static inline int vdin_v4l2_if_isr(struct vdin_dev_s *pdev,
+				   struct vframe_s *vfp)
+{
+	return 0;
+}
+static inline void vdin_v4l2_create_device_files(struct device *dev)
+{
+}
+static inline void vdin_v4l2_remove_device_files(struct device *dev)
+{
+}
+#endif
 void vdin_dump_hist(struct vdin_dev_s *devp);
 
 #endif /* __TVIN_VDIN_DRV_H */

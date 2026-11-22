@@ -342,7 +342,7 @@ static void viuin_close(struct tvin_frontend_s *fe)
 		if (cpu_after_eq(MESON_CPU_MAJOR_ID_G12A)) {
 			wr_viu(VPU_VIU_VDIN_IF_MUX_CTRL, 0);
 			wr_viu(VPP_WRBAK_CTRL, 0);
-
+			wr_bits_viu(WR_BACK_MISC_CTRL, 0, 0, 2);
 		} else {
 			wr_bits_viu(VPU_VIU_VENC_MUX_CTRL, 0, 8, 4);
 			wr_bits_viu(VPU_VIU_VENC_MUX_CTRL, 0, 4, 4);
@@ -419,6 +419,7 @@ static void viuin_sig_property(struct tvin_frontend_s *fe,
 
 	switch (devp->parm.port) {
 	case TVIN_PORT_VIU1_VIDEO:
+	case TVIN_PORT_VIU1_WB0_VD1:
 	case TVIN_PORT_VIU1_WB0_POST_BLEND:
 		prop->color_format = TVIN_YUV444;
 		break;

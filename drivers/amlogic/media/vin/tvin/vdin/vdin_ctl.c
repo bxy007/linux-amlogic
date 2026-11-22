@@ -1760,6 +1760,18 @@ void vdin_set_matrix(struct vdin_dev_s *devp)
 	unsigned int offset = devp->addr_offset;
 	enum vdin_matrix_sel_e maxsel;
 
+	if (devp->raw_capture) {
+		wr(offset, VDIN_MATRIX_CTRL, 0);
+		if (is_meson_tm2_cpu() ||
+		    (get_cpu_type() == MESON_CPU_MAJOR_ID_SC2))
+			wr_bits(offset, VDIN_HDR2_MATRIXI_EN_CTRL, 0,
+				VDIN_MATRIX_EN_BIT, VDIN_MATRIX_EN_WID);
+		if (cpu_after_eq(MESON_CPU_MAJOR_ID_G12A) && devp->index == 1)
+			hdr_set(5, 0x9); /* HDR_BYPASS | HLG_BYPASS */
+		devp->csc_idx = VDIN_MATRIX_NULL;
+		return;
+	}
+
 	if (rgb_info_enable == 0) {
 		/* vdin_set_color_matrix1(devp->addr_offset, devp->fmt_info_p,
 		 * devp->format_convert);
@@ -3062,6 +3074,10 @@ void vdin_set_default_regmap(struct vdin_dev_s *devp)
 			wr_bits(0, VDIN_TOP_DOUBLE_CTRL, WR_SEL_VDIN0_NOR,
 				MIF0_OUT_SEL_BIT, VDIN_REORDER_SEL_WID);
 			wr(offset, VDIN_HDR2_MATRIXI_EN_CTRL, 0);
+		} else {
+			/* vdin1 normal->mif1 */
+			wr_bits(0, VDIN_TOP_DOUBLE_CTRL, WR_SEL_VDIN1_NOR,
+				MIF1_OUT_SEL_BIT, VDIN_REORDER_SEL_WID);
 		}
 	} else
 		wr(offset, VDIN_LFIFO_CTRL,     0x00000780);

@@ -516,6 +516,30 @@ bool IS_TVAFE_AVIN_SRC(enum tvin_port_e port);
 #define TVIN_IOC_S_FRAME_WR_EN		_IOW(_TM_T, 0x51, unsigned int)
 #define TVIN_IOC_G_INPUT_TIMING		_IOW(_TM_T, 0x52, struct tvin_format_s)
 
+/* VDIN1 single-frame 10-bit 4:2:2 Full-Pack snapshot ioctl (32/64-bit ABI safe) */
+#define VDIN_SNAP_PORT_VD1		0
+#define VDIN_SNAP_PORT_POST_BLEND	1
+#define VDIN_SNAP_PORT_VPP		2
+
+#define VDIN_SNAP_FLAG_RAW		(1U << 0)
+#define VDIN_SNAP_FLAG_COSITED_CHROMA	(1U << 1)
+#define VDIN_SNAP_FLAG_INTERLACED	(1U << 2)
+
+struct vdin_snapshot_req_s {
+	__u32 port;          /* in: VDIN_SNAP_PORT_* */
+	__u32 width;         /* in: requested width (0 = native); out: actual width */
+	__u32 height;        /* in: requested height (0 = native); out: actual height */
+	__u32 flags;         /* in/out: VDIN_SNAP_FLAG_* */
+	__u32 src_width;     /* out: display active width before scaling */
+	__u32 src_height;    /* out: display active height before scaling */
+	__u32 stride;        /* out: bytes per row copied into dst_ptr */
+	__u32 bytes_copied;  /* out: total bytes copied into dst_ptr */
+	__u64 dst_ptr;       /* in: user buffer pointer */
+	__u64 dst_size;      /* in: user buffer capacity in bytes */
+};
+
+#define TVIN_IOC_CAPTURE_SNAPSHOT	_IOWR(_TM_T, 0x53, struct vdin_snapshot_req_s)
+
 #define TVIN_IOC_S_CANVAS_RECOVERY  _IO(_TM_T, 0x0a)
 /* TVAFE */
 #define TVIN_IOC_S_AFE_VGA_PARM     _IOW(_TM_T, 0x16, struct tvafe_vga_parm_s)

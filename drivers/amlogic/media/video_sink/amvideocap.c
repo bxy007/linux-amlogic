@@ -619,15 +619,21 @@ static ssize_t amvideocap_YUV_to_RGB(
 		return -1;
 	}
 
-	stretchblt_noalpha_noblk(ge2d_amvideocap_context,
-					   0,
-					   0,
-					   ge2d_config.src_para.width,
-					   ge2d_config.src_para.height,
-					   0,
-					   0,
-					   ge2d_config.dst_para.width,
-					   ge2d_config.dst_para.height);
+	if (priv->want.at_flags == CAP_FLAG_AT_END) {
+		/* The end-of-frame callback can run in interrupt context. */
+		stretchblt_noalpha_noblk(ge2d_amvideocap_context, 0, 0,
+					ge2d_config.src_para.width,
+					ge2d_config.src_para.height, 0, 0,
+					ge2d_config.dst_para.width,
+					ge2d_config.dst_para.height);
+	} else {
+		/* Keep the canvas alive until GE2D has finished writing it. */
+		stretchblt_noalpha(ge2d_amvideocap_context, 0, 0,
+				  ge2d_config.src_para.width,
+				  ge2d_config.src_para.height, 0, 0,
+				  ge2d_config.dst_para.width,
+				  ge2d_config.dst_para.height);
+	}
 	if (canvas_idx)
 		canvas_pool_map_free_canvas(canvas_idx);
 
@@ -675,6 +681,11 @@ static int amvideocap_capture_one_frame(
 		curindex = index;
 	if (ret < 0 || !vf)
 		return -EAGAIN;
+	if (!vfput && (vf->type & VIDTYPE_COMPRESS) && !vf->canvas0Addr) {
+		/* For AFBC-only frames the linear canvas register can be stale. */
+		amvideocap_capture_put_frame(priv, vf);
+		return -EOPNOTSUPP;
+	}
 	pr_debug("%s: get vf type=%x\n", __func__, vf->type);
 
 #define CHECK_AND_SETVAL(want, def) ((want) > 0 ? (want) : (def))

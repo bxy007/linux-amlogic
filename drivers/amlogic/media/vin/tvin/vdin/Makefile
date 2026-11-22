@@ -13,6 +13,8 @@ tvin_vdin-objs += vdin_ctl.o
 tvin_vdin-objs += vdin_sm.o
 tvin_vdin-objs += vdin_canvas.o
 tvin_vdin-objs += vdin_afbce.o
+ifeq ($(CONFIG_AMLOGIC_UVM_CORE),y)
 tvin_vdin-objs += vdin_v4l2_if.o
 tvin_vdin-objs += vdin_v4l2_dbg.o
+endif
 
