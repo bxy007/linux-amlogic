@@ -26,6 +26,7 @@
 #include <linux/platform_device.h>
 #include <linux/regulator/consumer.h>
 #include <linux/cpu_cooling.h>
+#include <linux/amlogic/cpu_version.h>
 
 #include "../../thermal/thermal_core.h"
 
@@ -94,6 +95,14 @@
 #define R1P1_TS_REBOOT_ALL_EN	BIT(30)
 #define R1P1_TS_REBOOT_TIME	(0xff << 16)
 
+/* Nominal trims for G12A and G12B sensors with blank eFuse calibration. */
+#define G12_P_TSENSOR_EFUSE_BASE	0xff800268
+#define G12_D_TSENSOR_EFUSE_BASE	0xff800230
+#define G12A_P_TSENSOR_TRIM_INFO	0xda008049
+#define G12A_D_TSENSOR_TRIM_INFO	0xda008081
+#define G12B_P_TSENSOR_TRIM_INFO	0xfa008092
+#define G12B_D_TSENSOR_TRIM_INFO	0xfa0080cf
+
 /*for all thermal sensor*/
 #define MCELSIUS	1000
 #define MAX_TS_NUM	3
@@ -131,6 +140,7 @@ struct meson_tsensor_data {
 	struct meson_tsensor_platform_data *pdata;
 	void __iomem *base_c;
 	void __iomem *base_e;
+	phys_addr_t efuse_base;
 	int irq;
 	enum soc_type soc;
 	struct work_struct irq_work;
@@ -340,6 +350,29 @@ static void r1p1_tsensor_control(struct platform_device *pdev, bool on)
 }
 
 
+static u32 r1p1_default_trim_info(const struct meson_tsensor_data *data)
+{
+	const struct meson_tsensor_platform_data *pdata = data->pdata;
+	bool primary = data->efuse_base == G12_P_TSENSOR_EFUSE_BASE;
+
+	if (!primary && data->efuse_base != G12_D_TSENSOR_EFUSE_BASE)
+		return 0;
+
+	/* The fallback also feeds the trip and hardware reboot thresholds. */
+	if (pdata->cal_type != 1 || pdata->cal_a <= 0 || pdata->cal_b <= 0 ||
+	    pdata->cal_c <= 0 || pdata->cal_d <= 0 || pdata->reboot_temp <= 0)
+		return 0;
+
+	switch (get_cpu_type()) {
+	case MESON_CPU_MAJOR_ID_G12A:
+		return primary ? G12A_P_TSENSOR_TRIM_INFO : G12A_D_TSENSOR_TRIM_INFO;
+	case MESON_CPU_MAJOR_ID_G12B:
+		return primary ? G12B_P_TSENSOR_TRIM_INFO : G12B_D_TSENSOR_TRIM_INFO;
+	default:
+		return 0;
+	}
+}
+
 static int r1p1_tsensor_initialize(struct platform_device *pdev)
 {
 	struct meson_tsensor_data *data = platform_get_drvdata(pdev);
@@ -356,6 +389,13 @@ static int r1p1_tsensor_initialize(struct platform_device *pdev)
 	/*frist get the r1p1 trim info*/
 	trim_info = readl(data->base_e + R1P1_TRIM_INFO);
 	pr_info("tsensor trim info: 0x%x!\n", trim_info);
+	if (!trim_info) {
+		trim_info = r1p1_default_trim_info(data);
+		if (trim_info)
+			dev_warn(&pdev->dev,
+				 "Blank eFuse calibration, using default trim 0x%08x\n",
+				 trim_info);
+	}
 	ver = (trim_info >> 24) & 0xff;
 	/*r1p1 tsensor ver to doing*/
 	if (((ver & 0xf) >> 2) == 0) {
@@ -662,6 +702,7 @@ static int meson_map_dt_data(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Failed to ioremap memory\n");
 		return -ENOMEM;
 	}
+	data->efuse_base = res.start;
 	pdata = devm_kzalloc(&pdev->dev,
 			     sizeof(struct meson_tsensor_platform_data),
 			     GFP_KERNEL);
