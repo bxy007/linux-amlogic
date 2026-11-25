@@ -146,6 +146,8 @@ extern void osd_init_scan_mode(void);
 extern void osd_suspend_hw(void);
 extern void osd_resume_hw(void);
 extern void osd_shutdown_hw(void);
+void osd_register_single_layer_premult(struct device *parent);
+void osd_unregister_single_layer_premult(void);
 extern void osd_init_hw(u32 logo_loaded, u32 osd_probe,
 	struct osd_device_data_s *osd_meson);
 extern void osd_init_viu2(void);

@@ -4882,6 +4882,9 @@ static int osd_probe(struct platform_device *pdev)
 #endif
 	INIT_DELAYED_WORK(&osd_dwork, mem_free_work);
 	schedule_delayed_work(&osd_dwork, msecs_to_jiffies(60 * 1000));
+	if (osd_meson_dev.osd_ver == OSD_HIGH_ONE && gp_fbdev_list[OSD1] &&
+	    gp_fbdev_list[OSD1]->fb_info->node == 0)
+		osd_register_single_layer_premult(&pdev->dev);
 
 	osd_log_info("osd probe OK\n");
 	return 0;
@@ -4904,6 +4907,7 @@ static int osd_remove(struct platform_device *pdev)
 		amlfb_virtual_remove(pdev);
 		return 0;
 	}
+	osd_unregister_single_layer_premult();
 #ifdef CONFIG_AMLOGIC_LEGACY_EARLY_SUSPEND
 	unregister_early_suspend(&early_suspend);
 #endif

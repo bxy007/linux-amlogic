@@ -31,6 +31,8 @@
 #include <linux/ktime.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
+#include <linux/miscdevice.h>
+#include <linux/mutex.h>
 #include <linux/sysfs.h>
 #include <linux/uaccess.h>
 #include <asm/div64.h>
@@ -680,6 +682,155 @@ module_param(vsync_threshold, uint, 0664);
 MODULE_PARM_DESC(vsync_adjust_hit, "\n vsync_adjust_hit\n");
 module_param(vsync_adjust_hit, uint, 0664);
 
+
+static void osd_update_single_layer_premult(u32 index);
+
+static bool single_layer_premult_div = false;
+static DEFINE_MUTEX(single_layer_premult_lock);
+static struct file *single_layer_premult_owner;
+static bool single_layer_premult_saved;
+
+static int single_layer_premult_div_set(const char *val,
+					const struct kernel_param *kp)
+{
+	int ret;
+
+	mutex_lock(&single_layer_premult_lock);
+	ret = param_set_bool(val, kp);
+	if (!ret && osd_hw.osd_meson_dev.osd_ver == OSD_HIGH_ONE)
+		osd_update_single_layer_premult(OSD1);
+	mutex_unlock(&single_layer_premult_lock);
+	return ret;
+}
+
+static const struct kernel_param_ops single_layer_premult_div_ops = {
+	.set = single_layer_premult_div_set,
+	.get = param_get_bool,
+};
+MODULE_PARM_DESC(single_layer_premult_div,
+	"\n un-premultiply premultiplied alpha in OSD1 MIF for single-layer fbdev\n");
+module_param_cb(single_layer_premult_div, &single_layer_premult_div_ops,
+	&single_layer_premult_div, 0644);
+
+static bool osd_color_has_alpha(const struct color_bit_define_s *color)
+{
+	if (!color)
+		return false;
+	return (color->color_index >= COLOR_INDEX_32_BGRA &&
+		color->color_index <= COLOR_INDEX_32_ARGB) ||
+	       color->color_index == COLOR_INDEX_RGBA_1010102;
+}
+
+static bool osd_single_layer_premult_enabled(u32 index)
+{
+	return index == OSD1 &&
+	       osd_hw.osd_meson_dev.osd_ver == OSD_HIGH_ONE &&
+	       !osd_hw.hwc_enable[VIU1] &&
+	       READ_ONCE(single_layer_premult_div) &&
+	       !osd_hw.blend_bypass &&
+	       osd_color_has_alpha(osd_hw.color_info[index]);
+}
+
+static void osd_update_single_layer_premult(u32 index)
+{
+	if (index != OSD1 ||
+	    osd_hw.osd_meson_dev.osd_ver != OSD_HIGH_ONE ||
+	    osd_hw.hwc_enable[VIU1])
+		return;
+	VSYNCOSD_WR_MPEG_REG_BITS(
+		hw_osd_reg_array[index].osd_mali_unpack_ctrl,
+		osd_single_layer_premult_enabled(index) ? 0x1 : 0x0,
+		28, 1);
+}
+
+/* The renderer opts in for the lifetime of its descriptor. The file release
+ * also runs on abnormal process exit. Retain the sysfs request for diagnostics.
+ */
+static int osd_single_layer_premult_open(struct inode *inode, struct file *file)
+{
+	int ret = 0;
+
+	mutex_lock(&single_layer_premult_lock);
+	if (single_layer_premult_owner || osd_hw.hwc_enable[VIU1]) {
+		ret = -EBUSY;
+	} else {
+		single_layer_premult_owner = file;
+		single_layer_premult_saved = single_layer_premult_div;
+		WRITE_ONCE(single_layer_premult_div, true);
+		osd_update_single_layer_premult(OSD1);
+	}
+	mutex_unlock(&single_layer_premult_lock);
+	return ret;
+}
+
+static int osd_single_layer_premult_release(struct inode *inode, struct file *file)
+{
+	mutex_lock(&single_layer_premult_lock);
+	if (single_layer_premult_owner == file) {
+		single_layer_premult_owner = NULL;
+		WRITE_ONCE(single_layer_premult_div, single_layer_premult_saved);
+		osd_update_single_layer_premult(OSD1);
+	}
+	mutex_unlock(&single_layer_premult_lock);
+	return 0;
+}
+
+static ssize_t osd_single_layer_premult_read(struct file *file,
+					     char __user *buf, size_t count,
+					     loff_t *pos)
+{
+	char active;
+
+	mutex_lock(&single_layer_premult_lock);
+	active = single_layer_premult_owner == file &&
+		 osd_single_layer_premult_enabled(OSD1) ? 'Y' : 'N';
+	mutex_unlock(&single_layer_premult_lock);
+	return simple_read_from_buffer(buf, count, pos, &active, sizeof(active));
+}
+
+static const struct file_operations osd_single_layer_premult_fops = {
+	.owner = THIS_MODULE,
+	.open = osd_single_layer_premult_open,
+	.release = osd_single_layer_premult_release,
+	.read = osd_single_layer_premult_read,
+	.llseek = no_llseek,
+};
+
+static struct miscdevice osd_single_layer_premult_dev = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "osd1-premult",
+	.fops = &osd_single_layer_premult_fops,
+	.mode = 0600,
+};
+
+void osd_register_single_layer_premult(struct device *parent)
+{
+	int ret;
+
+	osd_single_layer_premult_dev.parent = parent;
+	ret = misc_register(&osd_single_layer_premult_dev);
+	if (ret) {
+		osd_single_layer_premult_dev.this_device = NULL;
+		dev_warn(parent, "could not register osd1-premult: %d\n", ret);
+	}
+}
+
+void osd_unregister_single_layer_premult(void)
+{
+	if (!osd_single_layer_premult_dev.this_device)
+		return;
+
+	misc_deregister(&osd_single_layer_premult_dev);
+	osd_single_layer_premult_dev.this_device = NULL;
+	osd_single_layer_premult_dev.minor = MISC_DYNAMIC_MINOR;
+	mutex_lock(&single_layer_premult_lock);
+	if (single_layer_premult_owner) {
+		single_layer_premult_owner = NULL;
+		WRITE_ONCE(single_layer_premult_div, single_layer_premult_saved);
+		osd_update_single_layer_premult(OSD1);
+	}
+	mutex_unlock(&single_layer_premult_lock);
+}
 
 static unsigned int osd_filter_coefs_bicubic_sharp[] = {
 	0x01fa008c, 0x01fa0100, 0xff7f0200, 0xfe7f0300,
@@ -3018,6 +3169,7 @@ void osd_set_blend_bypass(int index, u32 blend_bypass)
 				(VIU_OSD_BLEND_CTRL,
 				0x1, 26, 1);
 		}
+		osd_update_single_layer_premult(OSD1);
 	}
 }
 
@@ -6155,6 +6307,7 @@ static void osd_update_color_mode(u32 index)
 			VSYNCOSD_WR_MPEG_REG_BITS(
 				osd_reg->osd_ctrl_stat2,
 				0, 6, 9);
+		osd_update_single_layer_premult(index);
 	}
 	remove_from_update_list(index, OSD_COLOR_MODE);
 }
@@ -9482,6 +9635,7 @@ static void osd_setting_default_hwc(void)
 	VSYNCOSD_WR_MPEG_REG(VPP_OSD1_IN_SIZE,
 		blend_vsize  << 16 |
 		blend_hsize);
+	osd_update_single_layer_premult(OSD1);
 }
 
 static bool set_old_hwc_freescale(u32 index)
@@ -11127,6 +11281,12 @@ void osd_resume_hw(void)
 			osd_hw.reg_status_save3);
 		osd_reg_write(VPU_MAFBC_SURFACE_CFG,
 			osd_hw.reg_status_save4);
+		if (osd_hw.osd_meson_dev.osd_ver == OSD_HIGH_ONE &&
+		    !osd_hw.hwc_enable[VIU1])
+			osd_reg_set_bits(
+				hw_osd_reg_array[OSD1].osd_mali_unpack_ctrl,
+				osd_single_layer_premult_enabled(OSD1) ? 1 : 0,
+				28, 1);
 		for (i = 0; i < osd_hw.osd_meson_dev.osd_count; i++)
 			osd_hw.osd_afbcd[i].afbc_start = 0;
 		spin_unlock_irqrestore(&osd_lock, lock_flags);
