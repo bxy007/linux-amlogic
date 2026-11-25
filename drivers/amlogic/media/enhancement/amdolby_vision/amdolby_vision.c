@@ -6630,6 +6630,7 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	int total_md_size = 0;
 	int total_comp_size = 0;
 	bool vp_no_ext_md = false;
+	bool sdr_boost_applied = false;
 	u32 md_size_use = 0;
 	bool el_flag = 0;
 	bool el_halfsize_flag = 1;
@@ -6649,6 +6650,7 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	int ret_flags = 0;
 	static int bypass_frame = -1;
 	static int last_current_format = FORMAT_INVALID;
+	static bool last_cuva_is_hlg;
 	int ret = -1;
 	bool mel_flag = false;
 	unsigned long time_use = 0;
@@ -6664,6 +6666,7 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 
 	if (dv_provider_changed) {
 		dv_std_ycc_invalidate_source();
+		last_cuva_is_hlg = false;
 		dv_provider_changed = false;
 		if (metadata_parser) {
 			if (p_funcs_stb)
@@ -6829,8 +6832,12 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 		if (src_format != FORMAT_DOVI && is_mvc_frame(vf))
 			src_format = FORMAT_MVC;
 
-		if ((src_format != FORMAT_CUVA) && is_cuva_frame(vf))
+		if (is_cuva_frame(vf)) {
 			src_format = FORMAT_CUVA;
+			last_cuva_is_hlg = vf_is_hlg(vf);
+		} else {
+			last_cuva_is_hlg = false;
+		}
 
 		/* TODO: need 962e ? */
 		if (src_format == FORMAT_SDR &&
@@ -7333,7 +7340,7 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 
 	if (xbmc_dv_sdr_src_max_nits && !amdv_multi_dv_mode && (xbmc_dv_vp == 0) &&
 	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL)) &&
-	    is_dv_ll() && (dst_format == FORMAT_SDR) && (total_md_size > 67)) {
+	    (dst_format == FORMAT_SDR) && (total_md_size > 67)) {
 		u32 boost_nits = sdr_src_boost_nits(xbmc_dv_md_level_6_max_cll ?
 			xbmc_dv_md_level_6_max_cll : xbmc_dv_hdr10_max_cll);
 
@@ -7345,13 +7352,15 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 			if (src_max_pq > cap_pq) {
 				md_buf[current_id][66] = cap_pq >> 8;
 				md_buf[current_id][67] = cap_pq & 0xff;
+				sdr_boost_applied = true;
 			}
 		}
 	}
 
 	if (!amdv_multi_dv_mode && (xbmc_dv_vp == 0) &&
 	    ((src_format == FORMAT_DOVI) || (src_format == FORMAT_DOVI_LL)) &&
-	    is_dv_ll() && (total_md_size > ETSI_META_OFFSET))
+	    (is_dv_ll() || (sdr_boost_applied && (dst_format == FORMAT_SDR))) &&
+	    (total_md_size > ETSI_META_OFFSET))
 	{
 		unsigned char *md_index = md_buf[current_id] + ETSI_META_OFFSET;
 		unsigned char *md_end_index = md_buf[current_id] + total_md_size;
@@ -7490,10 +7499,11 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 	if (module_installed) {
 		struct hdr10_parameter hdr10_param_use = hdr10_param;
 
-		if (xbmc_dv_sdr_src_max_nits && !amdv_multi_dv_mode && (xbmc_dv_vp == 0) && is_dv_ll() &&
+		if (xbmc_dv_sdr_src_max_nits && !amdv_multi_dv_mode && (xbmc_dv_vp == 0) &&
 		    (dst_format == FORMAT_SDR) &&
-		    ((src_format == FORMAT_HDR10) || (src_format == FORMAT_HLG) ||
-		     (src_format == FORMAT_HDR10PLUS) || (src_format == FORMAT_CUVA))) {
+		    ((src_format == FORMAT_HDR10) ||
+		     (src_format == FORMAT_HDR10PLUS) ||
+		     ((src_format == FORMAT_CUVA) && !(vf ? vf_is_hlg(vf) : last_cuva_is_hlg)))) {
 			bool no_cll = (src_format != FORMAT_HDR10);
 			u32 nits = sdr_src_boost_nits(no_cll ?
 				0 : hdr10_param_use.max_content_light_level);
