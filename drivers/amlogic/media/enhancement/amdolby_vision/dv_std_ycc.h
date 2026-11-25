@@ -2,11 +2,11 @@
 #ifndef DV_STD_YCC_H
 #define DV_STD_YCC_H
 
-/* Default-off video diagnostic parameter builder: no hardware/LUT access.
+/* Default-off standard-DV unit-bypass/mode1 YCC parameter builder.
  * Call with original, frame-matched algorithm settings and source ETSI DM.
  * This strict binary-unit/CSC-bypass path requests Core3 mode1, not mode5.
- * Its Core2 matrix covers only the linear part; GUI Y-black affine offset and
- * alpha are NOT qualified. Do not enable as a normal GUI/subtitle policy.
+ * When source DM carries a non-zero Y black offset (e.g. 256), Core2 CVM
+ * applies the exact +y_offset affine LUT via dv_std_ycc_build_cvm_lut().
  */
 #ifdef DV_STD_YCC_HOST_TEST
 #include <stdbool.h>
@@ -30,6 +30,8 @@ static inline u64 div64_u64(u64 n, u64 d) { return n / d; }
 #define DV_STD_YCC_C1_WORDS 27
 #define DV_STD_YCC_C2_WORDS 24
 #define DV_STD_YCC_C3_WORDS 26
+#define DV_STD_YCC_LUT_WORDS (256 * 5)
+#define DV_STD_YCC_LUT_UNITY 4096U
 
 enum dv_std_ycc_result {
 	DV_STD_YCC_OK = 0,
@@ -62,6 +64,7 @@ struct dv_std_ycc_setting {
 	bool bypass_csc1;
 	bool bypass_cvm1;
 	bool bypass_cvm2;
+	u16 y_offset;
 	u32 core3_mode;
 };
 
@@ -332,9 +335,9 @@ static int dv_std_ycc_build(const struct dv_std_ycc_input *in,
 	dv_std_ycc_pack(&p, next.dm2 + 12);
 	dv_std_ycc_pack(&n, next.dm2 + 17);
 	/* Core2 C2D=H^-1, NOT diag(1,2,2)*H^-1: this half-chroma domain
-	 * differs from the previous mode5 recipe. With source [oy,2048,2048],
-	 * the linear result still lacks +oy in GUI Y. c2d_off stays original0;
-	 * its affine layout is not proven. GUI remains explicitly unqualified. */
+	 * matches Core3 mode1. When source DM specifies a non-zero Y black
+	 * offset [oy,2048,2048], Core2 CVM applies +oy via tm_lut_i while
+	 * keeping tm_lut_s/sm_lut_i/sm_lut_s at unity (4096). */
 	next.dm3[12] = 4096;
 	next.dm3[13] = 0;
 	next.dm3[14] = 2048;
@@ -345,12 +348,38 @@ static int dv_std_ycc_build(const struct dv_std_ycc_input *in,
 	if (in->force_refresh)
 		next.metadata[1] = 1;
 	next.metadata_len = in->source_len;
+	next.y_offset = (u16)offsets[0];
 	next.bypass_csc1 = true;
 	next.bypass_cvm1 = true;
-	next.bypass_cvm2 = true;
+	next.bypass_cvm2 = (next.y_offset == 0);
 	next.core3_mode = 1;
 	*out = next;
 	return DV_STD_YCC_OK;
+}
+
+/* Build the first four Core2 CVM tables (1024 words) implementing the exact
+ * Y_out = min(4095, Y_in + y_offset), Cb/Cr unchanged affine transform.
+ * Caller preserves the native G2L block in words 1024..1279.
+ */
+static void dv_std_ycc_build_cvm_lut(u16 y_offset,
+				     u32 lut[DV_STD_YCC_LUT_WORDS])
+{
+	const u32 unity_pair = DV_STD_YCC_LUT_UNITY |
+			       (DV_STD_YCC_LUT_UNITY << 15);
+	u32 k;
+
+	for (k = 0; k < 256; k++) {
+		u32 v0 = 8U * (2U * k) + y_offset;
+		u32 v1 = 8U * (2U * k + 1U) + y_offset;
+
+		if (v0 > 4095U)
+			v0 = 4095U;
+		if (v1 > 4095U)
+			v1 = 4095U;
+		lut[k] = v0 | (v1 << 15);
+	}
+	for (k = 256; k < 1024; k++)
+		lut[k] = unity_pair;
 }
 
 #endif

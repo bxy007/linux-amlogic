@@ -781,6 +781,12 @@ static u8 dv_std_ycc_last_colour[48];
 static bool dv_std_ycc_last_colour_valid;
 static u32 dv_std_ycc_last_core3_mode;
 static bool dv_std_ycc_last_bypass_csc1;
+static u32 dv_std_ycc_cvm_lut[DV_STD_YCC_LUT_WORDS];
+static bool dv_std_ycc_cvm_active;
+static u16 dv_std_ycc_last_y_offset;
+static bool dv_std_ycc_cvm_built;
+static u16 dv_std_ycc_cvm_built_y_offset;
+static u64 dv_std_ycc_cvm_uploads;
 
 /* Standard-DV direct output IPT shares the frame-matched source cache above,
  * but has a separate request/state. Native algorithm results stay untouched.
@@ -905,11 +911,13 @@ static int dv_std_ycc_status_get(char *buf, const struct kernel_param *kp)
 
 	spin_lock_irqsave(&dv_std_ycc_lock, flags);
 	len = scnprintf(buf, PAGE_SIZE,
-		"experimental=1 video_only=1 gui_qualified=0 route=unit_mode1 enabled=%u active=%u reason=%s error=%d request=%u handled=%u epoch=%u source=%llu\n",
+		"experimental=1 video_only=0 gui_qualified=1 route=unit_mode1 enabled=%u active=%u reason=%s error=%d request=%u handled=%u epoch=%u source=%llu cvm=%u y_offset=%u cvm_uploads=%llu\n",
 		dv_std_ycc_enabled, dv_std_ycc_active, dv_std_ycc_reason,
 		dv_std_ycc_error, dv_std_ycc_request,
 		dv_std_ycc_handled_request, dv_std_ycc_epoch,
-		(unsigned long long)dv_std_ycc_committed_source.serial);
+		(unsigned long long)dv_std_ycc_committed_source.serial,
+		dv_std_ycc_cvm_active, dv_std_ycc_last_y_offset,
+		(unsigned long long)READ_ONCE(dv_std_ycc_cvm_uploads));
 	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
 	return len;
 }
@@ -956,6 +964,8 @@ static void dv_std_ycc_hardware_off(void)
 	dv_std_ycc_invalidate_source();
 	spin_lock_irqsave(&dv_std_ycc_lock, flags);
 	dv_std_ycc_active = false;
+	dv_std_ycc_cvm_active = false;
+	dv_std_ycc_last_y_offset = 0;
 	dv_std_ycc_last_colour_valid = false;
 	dv_std_ycc_reason = dv_std_ycc_enabled ? "idle" : "disabled";
 	dv_std_ycc_error = 0;
@@ -2126,6 +2136,7 @@ static int dolby_core2_set
    bool force_dm,
    bool direct_output,
    bool direct_cvm,
+   u64 *cvm_upload_counter,
    bool force_reset)
 {
   int i;
@@ -2282,8 +2293,8 @@ static int dolby_core2_set
 
     memcpy(&dv_std_ipt_hw_lut, p_core2_lut, sizeof(dv_std_ipt_hw_lut));
     dv_std_ipt_hw_lut_valid = true;
-    if (direct_cvm)
-      dv_std_ipt_cvm_uploads++;
+    if (direct_cvm && cvm_upload_counter)
+      (*cvm_upload_counter)++;
 
     /* core2 lookup table program done */
 
@@ -3038,6 +3049,7 @@ static inline void source_meta_copy(
 struct dv_std_ycc_submission {
 	bool active;
 	bool changed;
+	bool cvm_active;
 	bool native_refresh;
 	u32 request;
 	const char *reason;
@@ -3078,8 +3090,9 @@ static struct dv_std_ycc_submission dv_std_ycc_prepare(int enable,
 	struct dv_std_ycc_input in;
 	unsigned long flags;
 	bool requested, was_active, colour_valid;
-	bool old_bypass_csc1;
+	bool old_bypass_csc1, old_cvm_active;
 	u8 old_colour[sizeof(dv_std_ycc_last_colour)];
+	u16 old_y_offset;
 	u32 epoch, len, old_core3_mode;
 
 	spin_lock_irqsave(&dv_std_ycc_lock, flags);
@@ -3092,6 +3105,8 @@ static struct dv_std_ycc_submission dv_std_ycc_prepare(int enable,
 	colour_valid = dv_std_ycc_last_colour_valid;
 	old_core3_mode = dv_std_ycc_last_core3_mode;
 	old_bypass_csc1 = dv_std_ycc_last_bypass_csc1;
+	old_cvm_active = dv_std_ycc_cvm_active;
+	old_y_offset = dv_std_ycc_last_y_offset;
 	memcpy(old_colour, dv_std_ycc_last_colour, sizeof(old_colour));
 	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
 
@@ -3137,12 +3152,13 @@ static struct dv_std_ycc_submission dv_std_ycc_prepare(int enable,
 	submit.reason = "unsupported_parameters";
 	if (submit.error != DV_STD_YCC_OK)
 		goto done;
-	/* The switch now selects only the old unit-normalized bypass consumer.
-	 * Do not accidentally submit the previous full-transform mode5 recipe. */
+	/* The switch selects only the unit-normalized bypass consumer.
+	 * When source DM specifies a non-zero Y black offset, Core2 CVM
+	 * provides the matching +y_offset affine curve. */
 	submit.reason = "unsupported_route";
 	if (dv_std_ycc_work.core3_mode != DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL ||
 	    !dv_std_ycc_work.bypass_csc1 || !dv_std_ycc_work.bypass_cvm1 ||
-	    !dv_std_ycc_work.bypass_cvm2)
+	    dv_std_ycc_work.bypass_cvm2 != (dv_std_ycc_work.y_offset == 0))
 		goto done;
 
 	len = reverse_dv_meta(dv_std_ycc_native_payload, &new_dovi_setting.md_reg3);
@@ -3154,9 +3170,20 @@ static struct dv_std_ycc_submission dv_std_ycc_prepare(int enable,
 	 * changes; source chroma420 is never copied onto the output422 transport. */
 	memcpy(dv_std_ycc_native_payload + 2, dv_std_ycc_work.metadata + 2, 48);
 	memcpy(dv_std_ycc_native_payload + 61, dv_std_ycc_work.metadata + 61, 3);
+	submit.cvm_active = !dv_std_ycc_work.bypass_cvm2;
+	if (submit.cvm_active &&
+	    (!dv_std_ycc_cvm_built ||
+	     dv_std_ycc_cvm_built_y_offset != dv_std_ycc_work.y_offset)) {
+		dv_std_ycc_build_cvm_lut(dv_std_ycc_work.y_offset,
+					 dv_std_ycc_cvm_lut);
+		dv_std_ycc_cvm_built_y_offset = dv_std_ycc_work.y_offset;
+		dv_std_ycc_cvm_built = true;
+	}
 	submit.changed = !was_active || !colour_valid ||
 		old_core3_mode != dv_std_ycc_work.core3_mode ||
 		old_bypass_csc1 != dv_std_ycc_work.bypass_csc1 ||
+		old_cvm_active != submit.cvm_active ||
+		old_y_offset != dv_std_ycc_work.y_offset ||
 		memcmp(old_colour, dv_std_ycc_native_payload + 2, sizeof(old_colour));
 	if (submit.changed)
 		dv_std_ycc_native_payload[1] = 1;
@@ -3169,6 +3196,7 @@ static struct dv_std_ycc_submission dv_std_ycc_prepare(int enable,
 	submit.reason = "active";
 done:
 	if (!submit.active) {
+		submit.cvm_active = false;
 		submit.changed = was_active;
 		if (was_active) {
 			len = reverse_dv_meta(dv_std_ycc_native_payload,
@@ -3192,6 +3220,8 @@ static void dv_std_ycc_finish(const struct dv_std_ycc_submission *submit,
 	spin_lock_irqsave(&dv_std_ycc_lock, flags);
 	if (programming_allowed && (!submit->changed || (mask & 7) == 7)) {
 		dv_std_ycc_active = submit->active;
+		dv_std_ycc_cvm_active = submit->active && submit->cvm_active;
+		dv_std_ycc_last_y_offset = submit->active ? dv_std_ycc_work.y_offset : 0;
 		dv_std_ycc_last_colour_valid = submit->active;
 		if (submit->active)
 			memcpy(dv_std_ycc_last_colour,
@@ -3536,20 +3566,27 @@ static void apply_stb_core_settings
       memcpy(&new_dovi_setting.dm_lut2, &dovi_setting.dm_lut2, sizeof(struct dm_lut_ipcore));
 
     /* Preserve the exact current native PQ/G2L block; only the four curve
-     * tables come from the private neutral-profile generator.
+     * tables come from the private YCC black-level or neutral-profile generator.
      */
-    if (ipt.active && ipt.cvm_active)
+    BUILD_BUG_ON(sizeof(dv_std_ycc_cvm_lut) != sizeof(new_dovi_setting.dm_lut2));
+    if (ycc.active && ycc.cvm_active)
+      memcpy(dv_std_ycc_cvm_lut + 1024,
+             ((u32 *)&new_dovi_setting.dm_lut2) + 1024, 256 * sizeof(u32));
+    else if (ipt.active && ipt.cvm_active)
       memcpy(dv_std_ipt_gui_cvm.lut + 1024,
              ((u32 *)&new_dovi_setting.dm_lut2) + 1024, 256 * sizeof(u32));
     dolby_core2_set(
         dm2,
-        ipt.active && ipt.cvm_active ? dv_std_ipt_gui_cvm.lut :
+        (ycc.active && ycc.cvm_active) ? dv_std_ycc_cvm_lut :
+        (ipt.active && ipt.cvm_active) ? dv_std_ipt_gui_cvm.lut :
           (u32 *)&new_dovi_setting.dm_lut2,
         graphics_w,
         graphics_h,
         force_dm,
         ycc.active || ipt.active,
-        ipt.active && ipt.cvm_active,
+        (ycc.active && ycc.cvm_active) || (ipt.active && ipt.cvm_active),
+        (ycc.active && ycc.cvm_active) ? &dv_std_ycc_cvm_uploads :
+        (ipt.active && ipt.cvm_active) ? &dv_std_ipt_cvm_uploads : NULL,
         ycc.changed || ipt.changed);
   }
 
