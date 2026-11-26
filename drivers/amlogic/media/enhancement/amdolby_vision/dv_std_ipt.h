@@ -6,18 +6,23 @@
  * Inputs must be ORIGINAL settings and the matching frame's source/output
  * ETSI DM. The caller owns mode/epoch/VSYNC gating and atomic application.
  *
- * Video: At = row_normalize(inv(output M2) * source M2), Q15;
- *        Ct = inv(output M1), Q12, with constrained neutral row sums.
- * GUI:   Ag' = At * inv(native video A2B) * native GUI A2B.
+ * Video (YCbCr P7/P8):
+ *        At = row_normalize(inv(output M2) * source M2), Q15;
+ *        Ct = inv(output M1), Q12, with constrained neutral row sums;
+ *        Core1 CSC enabled, both CVMs bypassed.
+ * Video (IPT-PQ-C2 P5, matching full-range output M1/M2 and [0,2048,2048]):
+ *        Core1 CSC and CVM bypassed with binary-unit port scaling (dm1[2..4] =
+ *        0x100000 / 0x08000000 / 2048), eliminating both depq1024+l2pq128 passes
+ *        while retaining Core1 Composer reshaping and native IPT-PQ-C2 output DM.
+ * GUI:   Ag' = At * inv(native video A2B) * native GUI A2B (with At = I for P5).
  * At already includes source M2: another source-RPU correction is WRONG.
  * GUI rebase covers only the linear basis, not CVM/PMA/alpha qualification.
- * The matrix-only bundle bypasses both CVMs. A caller may separately provide
- * a matching private GUI curve; retaining native GUI CVM is not equivalent.
+ * Both CVMs must be bypassed; retaining native GUI CVM is not equivalent.
  * GUI RGB is assumed <= 1000 nits (linear <= 0.1 of the PQ 10000-nit unit).
  * A <= 1+1/1024 GUI row gain retains native coefficient rounding, with ample
  * headroom at that peak. This is NOT a full-10000-nit GUI clipping guarantee.
- * Output metadata, source CSC, EOTF, PQ LUTs and normalization stay original.
- * This contract is NOT for LLDV/HDR10 or source RGB/P5.
+ * Output metadata, source CSC (P7/P8), EOTF, PQ LUTs and normalization stay
+ * original. This contract is NOT for LLDV/HDR10 or source RGB.
  */
 #ifdef DV_STD_IPT_HOST_TEST
 #include <stdbool.h>
@@ -72,7 +77,7 @@ struct dv_std_ipt_setting {
 	u32 core3_mode;
 	bool bypass_csc1;
 	bool bypass_cvm1;
-	bool bypass_cvm2; /* Default for this builder; private GUI CVM may replace it. */
+	bool bypass_cvm2;
 	bool gui_rebased; /* Geometric rebase only; NOT GUI display qualification. */
 };
 
@@ -313,8 +318,9 @@ static inline bool dv_std_ipt_metadata(const u8 *md, u32 len, bool output,
 
 	if (len < 71 || len > DV_STD_IPT_META_MAX || md[0] || md[1] > 1 ||
 	    md[50] != 255 || md[51] != 255 || md[60] != 12 ||
-	    md[61] != (output ? 2 : 0) || md[62] > 2 || md[63] != 1 ||
-	    (output && md[62] != 1))
+	    (output ? (md[61] != 2 || md[62] != 1) :
+		      ((md[61] != 0 && md[61] != 2) || md[62] > 2)) ||
+	    md[63] != 1)
 		return false;
 	for (i = 52; i < 60; i++)
 		if (md[i])
@@ -472,6 +478,37 @@ static inline bool dv_std_ipt_gui(const struct dv_std_ipt_matrix *target,
 	return false;
 }
 
+/* Profile 5 full-range IPT-PQ-C2 source vs STDV IPT-PQ-C2 output basis check.
+ * Real P5 streams encode M1 column 0 as 8192 (4096-normalized) and M2 rounded
+ * to nearest ([17081,-349,...]), whereas dovi5 output DM encodes M1 column 0 as
+ * 8194 (4095-normalized) and M2 truncated ([17080,-348,...]). Reject distinct
+ * crosstalk bases (e.g. 0% C1 or 4% internal) and non-matching chroma axes.
+ */
+static inline bool dv_std_ipt_p5_basis_match(const struct dv_std_ipt_matrix *s1,
+					     const struct dv_std_ipt_matrix *s2,
+					     const struct dv_std_ipt_matrix *o1,
+					     const struct dv_std_ipt_matrix *o2)
+{
+	s64 adj[9], det;
+	int i;
+
+	if (s1->shift != 13 || o1->shift != 13 ||
+	    s2->shift != 14 || o2->shift != 14)
+		return false;
+	if (s1->c[0] < 8192 || s1->c[0] > 8200 ||
+	    s1->c[0] != s1->c[3] || s1->c[0] != s1->c[6] ||
+	    dv_std_ipt_abs((s64)s1->c[0] - o1->c[0]) > 2)
+		return false;
+	for (i = 0; i < 9; i++) {
+		if ((i % 3) && dv_std_ipt_abs((s64)s1->c[i] - o1->c[i]) > 1)
+			return false;
+		if (dv_std_ipt_abs((s64)s2->c[i] - o2->c[i]) > 2)
+			return false;
+	}
+	return dv_std_ipt_inverse_data(s2, adj, &det) &&
+	       dv_std_ipt_inverse_data(o2, adj, &det);
+}
+
 static inline int dv_std_ipt_build(const struct dv_std_ipt_input *in,
 				    struct dv_std_ipt_setting *out)
 {
@@ -479,6 +516,7 @@ static inline int dv_std_ipt_build(const struct dv_std_ipt_input *in,
 	struct dv_std_ipt_matrix h, source, o1, o2, native, gui, at, ct, ag, cv, cg;
 	s32 offsets[3], target_offsets[3];
 	s64 post, adj[9], det;
+	bool source_ipt;
 	int i, r, c;
 
 	if (!in || !out || !in->source_meta || !in->output_meta ||
@@ -493,6 +531,9 @@ static inline int dv_std_ipt_build(const struct dv_std_ipt_input *in,
 		return DV_STD_IPT_BAD_SOURCE;
 	if (!dv_std_ipt_metadata(in->output_meta, in->output_len, true, target_offsets))
 		return DV_STD_IPT_BAD_OUTPUT;
+	source_ipt = in->source_meta[61] == 2;
+	if (source_ipt && (offsets[0] || offsets[1] != 2048 || offsets[2] != 2048))
+		return DV_STD_IPT_BAD_SOURCE;
 	if (!dv_std_ipt_decode(in->dm1 + 5, &h) ||
 	    !dv_std_ipt_decode(in->dm1 + 14, &native) ||
 	    !dv_std_ipt_decode(in->dm2 + 12, &gui) ||
@@ -519,16 +560,39 @@ static inline int dv_std_ipt_build(const struct dv_std_ipt_input *in,
 	dv_std_ipt_read_matrix(in->source_meta, 32, 14, &source);
 	dv_std_ipt_read_matrix(in->output_meta, 2, 13, &o1);
 	dv_std_ipt_read_matrix(in->output_meta, 32, 14, &o2);
-	if (!dv_std_ipt_video(&source, &o2, &at) || !dv_std_ipt_target(&o1, &ct))
+	if (!dv_std_ipt_target(&o1, &ct))
 		return DV_STD_IPT_BAD_MATRIX;
+	if (source_ipt) {
+		if (!dv_std_ipt_p5_basis_match(&h, &source, &o1, &o2))
+			return DV_STD_IPT_BAD_SOURCE;
+		/* Source and output share the exact IPT-PQ-C2 LMS basis:
+		 * video bypasses Core1 CSC; GUI rebases with At = Q0 identity.
+		 */
+		memset(&at, 0, sizeof(at));
+		at.c[0] = 1;
+		at.c[4] = 1;
+		at.c[8] = 1;
+		at.shift = 0;
+	} else if (!dv_std_ipt_video(&source, &o2, &at)) {
+		return DV_STD_IPT_BAD_MATRIX;
+	}
 	if (!dv_std_ipt_gui(&at, &native, &gui, &ag))
 		return DV_STD_IPT_BAD_GUI;
 	memset(&next, 0, sizeof(next));
 	memcpy(next.dm1, in->dm1, sizeof(next.dm1));
 	memcpy(next.dm2, in->dm2, sizeof(next.dm2));
 	memcpy(next.dm3, in->dm3, sizeof(next.dm3));
-	dv_std_ipt_pack(&at, next.dm1 + 14);
-	dv_std_ipt_pack(&ct, next.dm1 + 19);
+	if (source_ipt) {
+		/* Binary-unit bypass port contract: A = [I, 2048 + floor((P-2048)/2),
+		 * 2048 + floor((T-2048)/2)], matching Core3 mode1 scale=4096.
+		 */
+		next.dm1[2] = 0x100000;
+		next.dm1[3] = 0x08000000;
+		next.dm1[4] = 2048;
+	} else {
+		dv_std_ipt_pack(&at, next.dm1 + 14);
+		dv_std_ipt_pack(&ct, next.dm1 + 19);
+	}
 	dv_std_ipt_pack(&ag, next.dm2 + 12);
 	dv_std_ipt_pack(&ct, next.dm2 + 17);
 	next.dm3[12] = 4096;
@@ -536,7 +600,7 @@ static inline int dv_std_ipt_build(const struct dv_std_ipt_input *in,
 	next.dm3[14] = 2048;
 	next.dm3[15] = 2048;
 	next.core3_mode = 1;
-	next.bypass_csc1 = false;
+	next.bypass_csc1 = source_ipt;
 	next.bypass_cvm1 = true;
 	next.bypass_cvm2 = true;
 	next.gui_rebased = true;

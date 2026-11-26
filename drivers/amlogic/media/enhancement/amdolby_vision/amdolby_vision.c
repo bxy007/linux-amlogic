@@ -71,8 +71,6 @@
 #include "dv_hdr10_encoding.h"
 #include "dv_std_ycc.h"
 #include "dv_std_ipt.h"
-#include "std_ipt_cvm/cvm.h"
-#include "std_ipt_cvm/metadata-policy.h"
 
 DEFINE_SPINLOCK(dovi_lock);
 
@@ -472,6 +470,19 @@ MODULE_PARM_DESC(xbmc_aml_linux_force_422, "\n xbmc_aml_linux_force_422\n");
 static bool xbmc_dv_deep_color;
 module_param(xbmc_dv_deep_color, bool, 0664);
 MODULE_PARM_DESC(xbmc_dv_deep_color, "\n xbmc_dv_deep_color\n");
+static bool dv_vpp_12bit_active;
+static bool dv_vpp_para1_12bit;
+static bool dv_hdmi_dither_active;
+
+static bool dv_wants_vpp_12bit(bool dvll, u32 mode)
+{
+	/* STDV RGB8/IPT tunnel always carries a 12-bit internal VPP datapath;
+	 * never silently truncate Core1->Core3 to 10-bit when prefer.12bit=0.
+	 */
+	return xbmc_dv_deep_color ||
+	       (!dvll && (mode == DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL ||
+			  mode == DOLBY_VISION_OUTPUT_MODE_IPT));
+}
 
 // extern
 
@@ -763,10 +774,6 @@ struct dv_std_ycc_source_cache {
 	u32 index;
 	u64 pts;
 	u32 len;
-	/* Effective public control_path GUI arguments, captured with this source. */
-	u32 graphic_min_10000;
-	u32 graphic_max_nits;
-	u32 graphics_priority;
 	u8 metadata[DV_STD_YCC_META_MAX];
 };
 
@@ -789,31 +796,41 @@ static u16 dv_std_ycc_cvm_built_y_offset;
 static u64 dv_std_ycc_cvm_uploads;
 
 /* Standard-DV direct output IPT shares the frame-matched source cache above,
- * but has a separate request/state. Native algorithm results stay untouched.
+ * but has a separate request/state. Native algorithm results and metadata stay
+ * untouched; Core1/Core2 CVMs are bypassed.
  * The older explicitly selected YCC experiment takes precedence. */
 static bool dv_std_ipt_enabled;
 static bool dv_std_ipt_active;
+static bool dv_std_ipt_bypass_csc1;
 static u32 dv_std_ipt_request;
 static u32 dv_std_ipt_handled_request;
 static int dv_std_ipt_error;
 static const char *dv_std_ipt_reason = "disabled";
 static struct dv_std_ipt_setting dv_std_ipt_work;
 static u8 dv_std_ipt_output_metadata[DV_STD_YCC_META_MAX];
-static u8 dv_std_ipt_policy_metadata[DV_STD_YCC_META_MAX];
-static u8 dv_std_ipt_last_metadata[DV_STD_YCC_META_MAX];
-static u32 dv_std_ipt_policy_metadata_len;
-static u32 dv_std_ipt_last_metadata_len;
-static bool dv_std_ipt_last_metadata_valid;
-static struct md_reg_ipcore3 dv_std_ipt_private_md;
-static struct dvm24_output_info dv_std_ipt_policy_info;
-static bool dv_std_ipt_metadata_edited;
-static u16 dv_std_ipt_l1_in[3], dv_std_ipt_l1_out[3];
-static struct dv_stb24_cvm dv_std_ipt_gui_cvm;
-static bool dv_std_ipt_cvm_active;
-static bool dv_std_ipt_hw_lut_valid;
-static bool dv_std_ipt_hw_cvm_active;
-static struct dm_lut_ipcore dv_std_ipt_hw_lut;
-static u64 dv_std_ipt_cvm_uploads;
+static bool dv_direct_hw_lut_valid;
+static bool dv_direct_hw_cvm_active;
+static struct dm_lut_ipcore dv_direct_hw_lut;
+
+enum dv_std_direct_route {
+	DV_STD_ROUTE_NONE = 0,
+	DV_STD_ROUTE_YCC = 1,
+	DV_STD_ROUTE_IPT = 2,
+};
+
+struct dv_std_direct_hw_verify {
+	bool pending;
+	u8 wait_vsyncs;
+	u8 route;
+	u32 request;
+	bool bypass_csc1;
+	u32 exp_c1_ctrl;
+	u32 exp_c2_ctrl_bit0;
+};
+
+static struct dv_std_direct_hw_verify dv_std_hw_verify;
+static bool dv_std_ycc_hw_failed;
+static bool dv_std_ipt_hw_failed;
 
 static int dv_std_ipt_enable_set(const char *val, const struct kernel_param *kp)
 {
@@ -826,6 +843,7 @@ static int dv_std_ipt_enable_set(const char *val, const struct kernel_param *kp)
 	spin_lock_irqsave(&dv_std_ycc_lock, flags);
 	if (dv_std_ipt_enabled != enabled) {
 		dv_std_ipt_enabled = enabled;
+		dv_std_ipt_hw_failed = false;
 		dv_std_ipt_request++;
 	}
 	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
@@ -846,22 +864,11 @@ static int dv_std_ipt_status_get(char *buf, const struct kernel_param *kp)
 
 	spin_lock_irqsave(&dv_std_ycc_lock, flags);
 	len = scnprintf(buf, PAGE_SIZE,
-		"experimental=1 gui_qualified=0 route=direct_ipt enabled=%u active=%u reason=%s error=%d request=%u handled=%u epoch=%u source=%llu cvm=%u cvm_reason=%s cvm_error=%d cvm_builds=%llu cvm_hits=%llu cvm_uploads=%llu cvm_us=%u cvm_max_us=%u policy=stb24_vpri metadata_unchanged=%u l1_in=%u:%u:%u l1_out=%u:%u:%u\n",
-		dv_std_ipt_enabled, dv_std_ipt_active, dv_std_ipt_reason,
-		dv_std_ipt_error, dv_std_ipt_request, dv_std_ipt_handled_request,
-		dv_std_ycc_epoch,
-		(unsigned long long)dv_std_ycc_committed_source.serial,
-		dv_std_ipt_cvm_active,
-		READ_ONCE(dv_std_ipt_gui_cvm.reason) ?: "idle",
-		READ_ONCE(dv_std_ipt_gui_cvm.detail),
-		(unsigned long long)READ_ONCE(dv_std_ipt_gui_cvm.builds),
-		(unsigned long long)READ_ONCE(dv_std_ipt_gui_cvm.hits),
-		(unsigned long long)READ_ONCE(dv_std_ipt_cvm_uploads),
-		READ_ONCE(dv_std_ipt_gui_cvm.last_us),
-		READ_ONCE(dv_std_ipt_gui_cvm.max_us),
-		!(dv_std_ipt_active && dv_std_ipt_metadata_edited),
-		dv_std_ipt_l1_in[0], dv_std_ipt_l1_in[1], dv_std_ipt_l1_in[2],
-		dv_std_ipt_l1_out[0], dv_std_ipt_l1_out[1], dv_std_ipt_l1_out[2]);
+		"experimental=1 gui_qualified=0 route=direct_ipt enabled=%u active=%u bypass_csc1=%u reason=%s error=%d request=%u handled=%u epoch=%u source=%llu cvm=0 metadata_unchanged=1\n",
+		dv_std_ipt_enabled, dv_std_ipt_active, dv_std_ipt_bypass_csc1,
+		dv_std_ipt_reason, dv_std_ipt_error, dv_std_ipt_request,
+		dv_std_ipt_handled_request, dv_std_ycc_epoch,
+		(unsigned long long)dv_std_ycc_committed_source.serial);
 	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
 	return len;
 }
@@ -876,7 +883,7 @@ static const struct kernel_param_ops dv_std_ipt_status_ops = {
 module_param_cb(dv_std_ipt, &dv_std_ipt_enable_ops, NULL, 0600);
 module_param_cb(dv_std_ipt_status, &dv_std_ipt_status_ops, NULL, 0400);
 MODULE_PARM_DESC(dv_std_ipt,
-	"Experimental SC2 standard-DV direct target IPT, default off");
+	"Experimental SC2/G12 standard-DV direct target IPT, default off");
 MODULE_PARM_DESC(dv_std_ipt_status,
 	"Direct target IPT submission state and native fallback reason");
 
@@ -891,6 +898,7 @@ static int dv_std_ycc_enable_set(const char *val, const struct kernel_param *kp)
 	spin_lock_irqsave(&dv_std_ycc_lock, flags);
 	if (dv_std_ycc_enabled != enabled) {
 		dv_std_ycc_enabled = enabled;
+		dv_std_ycc_hw_failed = false;
 		dv_std_ycc_request++;
 	}
 	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
@@ -932,7 +940,7 @@ static const struct kernel_param_ops dv_std_ycc_status_ops = {
 module_param_cb(dv_std_ycc, &dv_std_ycc_enable_ops, NULL, 0600);
 module_param_cb(dv_std_ycc_status, &dv_std_ycc_status_ops, NULL, 0400);
 MODULE_PARM_DESC(dv_std_ycc,
-	"Experimental video-only SC2 unit-bypass/mode1 YCC DV; GUI unqualified, default off");
+	"Experimental SC2/G12 unit-bypass/mode1 YCC DV, default off");
 MODULE_PARM_DESC(dv_std_ycc_status, "YCC experiment state and native fallback reason");
 
 static u32 dv_std_ycc_source_epoch(void)
@@ -946,9 +954,12 @@ static void dv_std_ycc_invalidate_source(void)
 
 	spin_lock_irqsave(&dv_std_ycc_lock, flags);
 	dv_std_ycc_epoch++;
+	dv_std_ycc_hw_failed = false;
+	dv_std_ipt_hw_failed = false;
 	dv_std_ycc_pending_source.present = false;
 	dv_std_ycc_pending_source.valid = false;
 	dv_std_ycc_committed_source.valid = false;
+	dv_std_hw_verify.pending = false;
 	if (dv_std_ycc_active || dv_std_ycc_enabled)
 		dv_std_ycc_request++;
 	if (dv_std_ipt_active || dv_std_ipt_enabled)
@@ -971,11 +982,10 @@ static void dv_std_ycc_hardware_off(void)
 	dv_std_ycc_error = 0;
 	dv_std_ycc_handled_request = dv_std_ycc_request;
 	dv_std_ipt_active = false;
-	dv_std_ipt_cvm_active = false;
-	dv_std_ipt_hw_lut_valid = false;
-	dv_std_ipt_hw_cvm_active = false;
-	dv_std_ipt_last_metadata_valid = false;
-	dv_std_ipt_metadata_edited = false;
+	dv_std_ipt_bypass_csc1 = false;
+	dv_std_hw_verify.pending = false;
+	dv_direct_hw_lut_valid = false;
+	dv_direct_hw_cvm_active = false;
 	dv_std_ipt_reason = dv_std_ipt_enabled ? "idle" : "disabled";
 	dv_std_ipt_error = 0;
 	dv_std_ipt_handled_request = dv_std_ipt_request;
@@ -987,8 +997,7 @@ static void dv_std_ycc_hardware_off(void)
  */
 static void dv_std_ycc_latch_source(struct vframe_s *vf, u32 epoch,
 				   const u8 *metadata, u32 len,
-				   bool source_dovi, u32 graphic_min,
-				   u32 graphic_max, u32 priority)
+				   bool source_dovi)
 {
 	struct dv_std_ycc_source_cache *s = &dv_std_ycc_pending_source;
 	unsigned long flags;
@@ -1015,11 +1024,6 @@ static void dv_std_ycc_latch_source(struct vframe_s *vf, u32 epoch,
 			s->present = true;
 			s->serial = serial;
 		}
-	}
-	if (s->valid) {
-		s->graphic_min_10000 = graphic_min;
-		s->graphic_max_nits = graphic_max;
-		s->graphics_priority = priority;
 	}
 	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
 }
@@ -1236,6 +1240,34 @@ static inline void WRITE_VPP_DV_REG_BITS(u32 adr, u32 val, u32 start, u32 len)
 	WRITE_VPP_REG_BITS(adr, val, start, len);
 }
 
+/* Apply the same precision policy during initial setup and live mode changes.
+ * LL's post matrix requires the second converter in 12-bit mode even when
+ * the first converter uses the user's 10-bit preference.
+ */
+static void dv_box2_output_precision(bool ll, u32 mode, bool initialize)
+{
+	bool vpp12 = dv_wants_vpp_12bit(ll, mode);
+	bool para1_12 = vpp12 || ll;
+	bool dither = xbmc_dv_deep_color &&
+		mode != DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL &&
+		mode != DOLBY_VISION_OUTPUT_MODE_IPT;
+
+	if (!(dolby_vision_flags & FLAG_CERTIFICAION) &&
+	    (initialize || vpp12 != dv_vpp_12bit_active ||
+	     para1_12 != dv_vpp_para1_12bit)) {
+		VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA0, vpp12 ? 0x08000800 : 0x20002000);
+		VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA1, para1_12 ? 0x08000800 : 0x20002000);
+		if (vpp12 || dv_vpp_12bit_active)
+			VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, !vpp12, 12, 1);
+		dv_vpp_12bit_active = vpp12;
+		dv_vpp_para1_12bit = para1_12;
+	}
+	if (dither != dv_hdmi_dither_active || (initialize && dither)) {
+		WRITE_VPP_DV_REG_BITS(VPU_HDMI_FMT_CTRL, dither, 4, 1);
+		dv_hdmi_dither_active = dither;
+	}
+}
+
 static u32 last_dst_format;
 
 static int dolby_vision_enable_set(const char *val, const struct kernel_param *kp)
@@ -1250,6 +1282,7 @@ static int dolby_vision_enable_set(const char *val, const struct kernel_param *k
 		amvecm_invalidate_cur_signal_type();
 		amvecm_invalidate_output_format();
 
+		dv_std_ycc_hardware_off();
 		if (dolby_vision_on) {
 			VSYNC_WR_DV_REG_BITS(DOLBY_PATH_CTRL,
 				(1 << 2) | (1 << 1) | (1 << 0), 0, 3);
@@ -1262,9 +1295,13 @@ static int dolby_vision_enable_set(const char *val, const struct kernel_param *k
 			VSYNC_WR_DV_REG(DOLBY_CORE3_CLKGATE_CTRL, 0x55555555);
 			dv_mem_power_off(VPU_DOLBY_CORE3);
 
-			if (xbmc_dv_deep_color) {
+			if (dv_vpp_12bit_active || xbmc_dv_deep_color) {
 				VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 1, 12, 1);
+				dv_vpp_12bit_active = false;
+			}
+			if (dv_hdmi_dither_active || xbmc_dv_deep_color) {
 				WRITE_VPP_DV_REG_BITS(VPU_HDMI_FMT_CTRL, 0, 4, 1);
+				dv_hdmi_dither_active = false;
 			}
 
 			enable_rgb_to_yuv_matrix_for_dvll(0, NULL, 12);
@@ -1274,7 +1311,6 @@ static int dolby_vision_enable_set(const char *val, const struct kernel_param *k
 		dolby_vision_wait_on = false;
 		dolby_vision_on_in_uboot = false;
 		dolby_vision_core1_on = false;
-		dv_std_ycc_hardware_off();
 
 		if (debug_dolby & 2)
 			pr_dolby_dbg("dolby_vision_enable=N: wire HDR clear + amvecm cache invalidate + DV cores disengage + on-flags reset\n");
@@ -2255,9 +2291,9 @@ static int dolby_core2_set
    * uploaded; CONST_TC2 must neither suppress a new candidate nor cause an
    * unchanged candidate to be re-uploaded on every video frame.
    */
-  if (direct_cvm || dv_std_ipt_hw_cvm_active)
-    set_lut = !dv_std_ipt_hw_lut_valid ||
-      memcmp(p_core2_lut, &dv_std_ipt_hw_lut, sizeof(dv_std_ipt_hw_lut));
+  if (direct_cvm || dv_direct_hw_cvm_active)
+    set_lut = !dv_direct_hw_lut_valid ||
+      memcmp(p_core2_lut, &dv_direct_hw_lut, sizeof(dv_direct_hw_lut));
 
   if (unlikely(dv_lut_dbg)) {
     bool lut2_changed = !reset &&
@@ -2291,8 +2327,8 @@ static int dolby_core2_set
       VSYNC_WR_DV_REG(DOLBY_CORE2A_DMA_PORT, p_core2_lut[i]);
     }
 
-    memcpy(&dv_std_ipt_hw_lut, p_core2_lut, sizeof(dv_std_ipt_hw_lut));
-    dv_std_ipt_hw_lut_valid = true;
+    memcpy(&dv_direct_hw_lut, p_core2_lut, sizeof(dv_direct_hw_lut));
+    dv_direct_hw_lut_valid = true;
     if (direct_cvm && cvm_upload_counter)
       (*cvm_upload_counter)++;
 
@@ -2303,7 +2339,7 @@ static int dolby_core2_set
 
   }
   force_set_lut = false;
-  dv_std_ipt_hw_cvm_active = direct_cvm;
+  dv_direct_hw_cvm_active = direct_cvm;
 
   /* enable core2 */
   VSYNC_WR_DV_REG(DOLBY_CORE2A_SWAP_CTRL0, 1);
@@ -2567,6 +2603,11 @@ static int dolby_core3_set
     }
     reset_post_table = true;
   }
+
+  if (dolby_vision_on && is_meson_box2())
+    dv_box2_output_precision(new_dovi_setting.dovi_ll_enable && !new_dovi_setting.diagnostic_enable &&
+                             (dolby_vision_mode == DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL ||
+                              dolby_vision_mode == DOLBY_VISION_OUTPUT_MODE_IPT), dolby_vision_mode, false);
 
   if ((new_dovi_setting.dovi_ll_enable ||
        cur_dv_mode == DOLBY_VISION_OUTPUT_MODE_HDR10 ||
@@ -3116,9 +3157,12 @@ static struct dv_std_ycc_submission dv_std_ycc_prepare(int enable,
 	submit.reason = "idle";
 	if (!enable || !hsize || !vsize)
 		goto done;
+	submit.reason = "hw_verify_failed";
+	if (READ_ONCE(dv_std_ycc_hw_failed))
+		goto done;
 	submit.reason = "mode";
-	if (!is_meson_sc2() || !amdv_multi_dv_mode || !p_funcs_new ||
-	    p_funcs_stb != p_funcs_new ||
+	if (!(is_meson_sc2() || is_meson_g12()) || !amdv_multi_dv_mode ||
+	    !p_funcs_new || p_funcs_stb != p_funcs_new ||
 	    dolby_vision_mode != DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL ||
 	    dolby_vision_ll_policy != DOLBY_VISION_LL_DISABLE ||
 	    new_dovi_setting.src_format != FORMAT_DOVI ||
@@ -3212,6 +3256,22 @@ done:
 	return submit;
 }
 
+/* Called with dv_std_ycc_lock held after submitting all changed cores. */
+static void dv_std_arm_hw_verify(u8 route, u32 request, bool changed,
+				 bool bypass_csc1, bool bypass_cvm2)
+{
+	if (!changed && dv_std_hw_verify.route == route &&
+	    dv_std_hw_verify.request == request)
+		return;
+	dv_std_hw_verify.pending = true;
+	dv_std_hw_verify.wait_vsyncs = 2;
+	dv_std_hw_verify.route = route;
+	dv_std_hw_verify.request = request;
+	dv_std_hw_verify.bypass_csc1 = bypass_csc1;
+	dv_std_hw_verify.exp_c1_ctrl = 0x70 | BIT(2) | (bypass_csc1 ? BIT(1) : 0);
+	dv_std_hw_verify.exp_c2_ctrl_bit0 = bypass_cvm2;
+}
+
 static void dv_std_ycc_finish(const struct dv_std_ycc_submission *submit,
 			      unsigned int mask, bool programming_allowed)
 {
@@ -3229,6 +3289,11 @@ static void dv_std_ycc_finish(const struct dv_std_ycc_submission *submit,
 		if (submit->active) {
 			dv_std_ycc_last_core3_mode = dv_std_ycc_work.core3_mode;
 			dv_std_ycc_last_bypass_csc1 = dv_std_ycc_work.bypass_csc1;
+			dv_std_arm_hw_verify(DV_STD_ROUTE_YCC, submit->request,
+					     submit->changed, dv_std_ycc_work.bypass_csc1,
+					     !submit->cvm_active);
+		} else if (dv_std_hw_verify.route == DV_STD_ROUTE_YCC) {
+			dv_std_hw_verify.pending = false;
 		}
 		dv_std_ycc_handled_request = submit->request;
 		dv_std_ycc_reason = submit->reason;
@@ -3244,25 +3309,16 @@ static void dv_std_ycc_finish(const struct dv_std_ycc_submission *submit,
 struct dv_std_ipt_submission {
 	bool active;
 	bool changed;
-	bool cvm_active;
-	bool metadata_changed;
-	bool metadata_edited;
-	bool native_refresh;
+	bool bypass_csc1;
 	u32 request;
 	const char *reason;
 	int error;
 };
 
-static bool dv_std_ipt_same_metadata(const u8 *a, const u8 *b, u32 len)
-{
-	/* Scene-refresh is a notification, not an input to the mapping policy. */
-	return len >= ETSI_META_OFFSET && a[0] == b[0] &&
-		!memcmp(a + 2, b + 2, len - 2);
-}
-
 /* Called after YCC prepare, which snapshots the common frame-matched source.
- * Matrices, GUI curves and the coupled transmitted packet are private.
- * Composer and original algorithm settings/LUT caches are never overwritten.
+ * Only Core1/Core2/Core3 matrices (or P5 unit bypass) and mode1 are private;
+ * Core1/Core2 CVMs are bypassed and native Composer, LUT caches and output
+ * metadata stay untouched.
  */
 static struct dv_std_ipt_submission dv_std_ipt_prepare(int enable,
 						       u32 hsize, u32 vsize,
@@ -3271,12 +3327,13 @@ static struct dv_std_ipt_submission dv_std_ipt_prepare(int enable,
 	struct dv_std_ipt_submission submit = {0};
 	struct dv_std_ipt_input in;
 	unsigned long flags;
-	bool requested, was_active, ycc_requested;
-	u32 epoch, sink_dm_version;
+	bool requested, was_active, was_bypass_csc1, ycc_requested;
+	u32 epoch;
 
 	spin_lock_irqsave(&dv_std_ycc_lock, flags);
 	requested = dv_std_ipt_enabled;
 	was_active = dv_std_ipt_active;
+	was_bypass_csc1 = dv_std_ipt_bypass_csc1;
 	ycc_requested = dv_std_ycc_enabled;
 	submit.request = dv_std_ipt_request;
 	epoch = dv_std_ycc_epoch;
@@ -3292,9 +3349,12 @@ static struct dv_std_ipt_submission dv_std_ipt_prepare(int enable,
 	submit.reason = "idle";
 	if (!enable || !hsize || !vsize)
 		goto done;
+	submit.reason = "hw_verify_failed";
+	if (READ_ONCE(dv_std_ipt_hw_failed))
+		goto done;
 	submit.reason = "mode";
-	if (!is_meson_sc2() || !amdv_multi_dv_mode || !p_funcs_new ||
-	    p_funcs_stb != p_funcs_new ||
+	if (!(is_meson_sc2() || is_meson_g12()) || !amdv_multi_dv_mode ||
+	    !p_funcs_new || p_funcs_stb != p_funcs_new ||
 	    dolby_vision_mode != DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL ||
 	    dolby_vision_ll_policy != DOLBY_VISION_LL_DISABLE ||
 	    new_dovi_setting.src_format != FORMAT_DOVI ||
@@ -3330,83 +3390,20 @@ static struct dv_std_ipt_submission dv_std_ipt_prepare(int enable,
 	submit.reason = dv_std_ipt_result_name(submit.error);
 	if (submit.error)
 		goto done;
+	submit.reason = "unsupported_route";
+	if (dv_std_ipt_work.core3_mode != DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL ||
+	    !dv_std_ipt_work.bypass_cvm1 ||
+	    !dv_std_ipt_work.bypass_cvm2 || !dv_std_ipt_work.gui_rebased)
+		goto done;
 	submit.reason = "source_changed";
 	if (epoch != dv_std_ycc_source_epoch() || !READ_ONCE(dolby_vision_enable))
 		goto done;
-	/* Both the private curve and its output metadata are derived from this
-	 * frame's original source, never from a previous adjusted output L1.
-	 * Any unsupported part rejects the entire direct bundle.
-	 */
-	submit.reason = "sink_metadata_version";
-	submit.error = dvm24_sink_version(new_dovi_setting.vsvdb_tbl,
-		new_dovi_setting.vsvdb_len, &sink_dm_version);
-	if (submit.error)
-		goto done;
-	if (dv_std_ycc_source_work.graphic_max_nits &&
-	    dv_std_ycc_source_work.graphic_max_nits <= 1000 &&
-	    dv_std_ycc_source_work.graphic_min_10000 <
-	      dv_std_ycc_source_work.graphic_max_nits * 10000) {
-		u32 min_q18 = (u32)div64_u64(
-			(u64)dv_std_ycc_source_work.graphic_min_10000 * 262144, 10000);
-		u32 max_q18 = dv_std_ycc_source_work.graphic_max_nits * 262144;
-
-		submit.error = dv_stb24_cvm_update_source(&dv_std_ipt_gui_cvm,
-			in.source_meta, in.source_len, min_q18, max_q18,
-			dv_std_ycc_source_work.graphics_priority);
-		submit.reason = dv_std_ipt_gui_cvm.reason;
-		if (submit.error)
-			goto done;
-	} else {
-		dv_std_ipt_gui_cvm.valid = false;
-		dv_std_ipt_gui_cvm.reason = "gui_range";
-		dv_std_ipt_gui_cvm.detail = -ERANGE;
-		submit.reason = "gui_range";
-		submit.error = -ERANGE;
-		goto done;
-	}
-	submit.reason = "metadata_policy";
-	submit.error = dvm24_output_policy(in.source_meta, in.source_len,
-		in.output_meta, in.output_len, dv_std_ipt_gui_cvm.control,
-		sink_dm_version, dv_std_ipt_policy_metadata,
-		&dv_std_ipt_policy_metadata_len, &dv_std_ipt_policy_info);
-	if (submit.error)
-		goto done;
-	submit.metadata_edited = in.output_len != dv_std_ipt_policy_metadata_len ||
-		memcmp(in.output_meta, dv_std_ipt_policy_metadata, in.output_len);
-	submit.metadata_changed = !was_active || !dv_std_ipt_last_metadata_valid ||
-		dv_std_ipt_last_metadata_len != dv_std_ipt_policy_metadata_len ||
-		!dv_std_ipt_same_metadata(dv_std_ipt_last_metadata,
-			dv_std_ipt_policy_metadata, dv_std_ipt_policy_metadata_len);
-	if (submit.metadata_changed)
-		dv_std_ipt_policy_metadata[1] = 1;
-	memset(&dv_std_ipt_private_md, 0, sizeof(dv_std_ipt_private_md));
-	prepare_dv_meta(&dv_std_ipt_private_md, dv_std_ipt_policy_metadata,
-			dv_std_ipt_policy_metadata_len);
-	if (epoch != dv_std_ycc_source_epoch() || !READ_ONCE(dolby_vision_enable)) {
-		submit.reason = "source_changed";
-		goto done;
-	}
 	submit.active = true;
-	submit.cvm_active = true;
-	submit.reason = "active";
-	dv_std_ipt_work.bypass_cvm2 = false;
+	submit.bypass_csc1 = dv_std_ipt_work.bypass_csc1;
+	submit.reason = submit.bypass_csc1 ? "active_p5_bypass" : "active";
 done:
-	submit.changed = was_active != submit.active;
-	if (!submit.active && was_active) {
-		u32 len = reverse_dv_meta(dv_std_ipt_output_metadata,
-					&new_dovi_setting.md_reg3);
-
-		/* Restore the native mapping as a new scene even on a paused frame.
-		 * This notification is private; the native setting remains intact.
-		 */
-		if (dv_std_ycc_native_metadata_valid(dv_std_ipt_output_metadata, len)) {
-			dv_std_ipt_output_metadata[1] = 1;
-			memset(&dv_std_ipt_private_md, 0, sizeof(dv_std_ipt_private_md));
-			prepare_dv_meta(&dv_std_ipt_private_md,
-				dv_std_ipt_output_metadata, len);
-			submit.native_refresh = true;
-		}
-	}
+	submit.changed = (was_active != submit.active) ||
+			 (submit.active && was_bypass_csc1 != submit.bypass_csc1);
 	return submit;
 }
 
@@ -3418,19 +3415,12 @@ static void dv_std_ipt_finish(const struct dv_std_ipt_submission *submit,
 	spin_lock_irqsave(&dv_std_ycc_lock, flags);
 	if (programming_allowed && (!submit->changed || (mask & 7) == 7)) {
 		dv_std_ipt_active = submit->active;
-		dv_std_ipt_cvm_active = submit->active && submit->cvm_active;
-		dv_std_ipt_metadata_edited = submit->active && submit->metadata_edited;
+		dv_std_ipt_bypass_csc1 = submit->active && submit->bypass_csc1;
 		if (submit->active) {
-			memcpy(dv_std_ipt_last_metadata, dv_std_ipt_policy_metadata,
-			       dv_std_ipt_policy_metadata_len);
-			dv_std_ipt_last_metadata_len = dv_std_ipt_policy_metadata_len;
-			dv_std_ipt_last_metadata_valid = true;
-			memcpy(dv_std_ipt_l1_in, dv_std_ipt_policy_info.input_l1,
-			       sizeof(dv_std_ipt_l1_in));
-			memcpy(dv_std_ipt_l1_out, dv_std_ipt_policy_info.output_l1,
-			       sizeof(dv_std_ipt_l1_out));
-		} else {
-			dv_std_ipt_last_metadata_valid = false;
+			dv_std_arm_hw_verify(DV_STD_ROUTE_IPT, submit->request,
+					     submit->changed, submit->bypass_csc1, true);
+		} else if (dv_std_hw_verify.route == DV_STD_ROUTE_IPT) {
+			dv_std_hw_verify.pending = false;
 		}
 		dv_std_ipt_handled_request = submit->request;
 		dv_std_ipt_reason = submit->reason;
@@ -3439,6 +3429,83 @@ static void dv_std_ipt_finish(const struct dv_std_ipt_submission *submit,
 		dv_std_ipt_reason = "settings_blocked";
 	}
 	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
+}
+
+/* One-shot post-latch hardware register sanity check for direct STDV routes.
+ * Runs at most once per activation/transition after RDMA has flushed (2 VSYNCs).
+ * On mismatch, locks the failing route off for this playback and triggers an
+ * immediate native restoration on the current VSYNC.
+ */
+static void dv_std_direct_check_hw_verify(void)
+{
+	struct dv_std_direct_hw_verify v;
+	unsigned long flags;
+	u32 c1_ctrl, c2_ctrl, c3_mode, c3_scale;
+	u32 dm1_2 = 0, dm1_3 = 0, dm1_4 = 0;
+	bool ok;
+
+	if (!READ_ONCE(dv_std_hw_verify.pending))
+		return;
+	if (!dolby_vision_on || !dolby_vision_core1_on ||
+	    (dolby_vision_flags & FLAG_DISABE_CORE_SETTING))
+		return;
+
+	spin_lock_irqsave(&dv_std_ycc_lock, flags);
+	if (!dv_std_hw_verify.pending || !READ_ONCE(dolby_vision_enable) ||
+	    (dv_std_hw_verify.route == DV_STD_ROUTE_YCC ?
+	     dv_std_hw_verify.request != dv_std_ycc_request :
+	     dv_std_hw_verify.request != dv_std_ipt_request)) {
+		spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
+		return;
+	}
+	if (dv_std_hw_verify.wait_vsyncs > 0) {
+		dv_std_hw_verify.wait_vsyncs--;
+		spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
+		return;
+	}
+	v = dv_std_hw_verify;
+	dv_std_hw_verify.pending = false;
+
+	c1_ctrl = READ_VPP_DV_REG(DOLBY_CORE1_REG_START + 1);
+	c2_ctrl = READ_VPP_DV_REG(DOLBY_CORE2A_CTRL);
+	c3_mode = READ_VPP_DV_REG(DOLBY_CORE3_REG_START + 1);
+	c3_scale = READ_VPP_DV_REG(DOLBY_CORE3_REG_START + 6 + 12);
+	ok = ((c1_ctrl & 0x77) == v.exp_c1_ctrl) &&
+	     ((c2_ctrl & 1) == v.exp_c2_ctrl_bit0) &&
+	     ((c3_mode & 7) == DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL) &&
+	     (c3_scale == 4096);
+	if (v.bypass_csc1) {
+		dm1_2 = READ_VPP_DV_REG(DOLBY_CORE1_REG_START + 6 + 2);
+		dm1_3 = READ_VPP_DV_REG(DOLBY_CORE1_REG_START + 6 + 3);
+		dm1_4 = READ_VPP_DV_REG(DOLBY_CORE1_REG_START + 6 + 4);
+		if (dm1_2 != 0x00100000 || dm1_3 != 0x08000000 || dm1_4 != 2048)
+			ok = false;
+	}
+	if (ok) {
+		spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
+		return;
+	}
+
+	if (v.route == DV_STD_ROUTE_YCC) {
+		dv_std_ycc_hw_failed = true;
+		dv_std_ycc_request++;
+	} else if (v.route == DV_STD_ROUTE_IPT) {
+		dv_std_ipt_hw_failed = true;
+		dv_std_ipt_request++;
+	}
+	spin_unlock_irqrestore(&dv_std_ycc_lock, flags);
+
+	pr_warn("amdolby_vision: dv_std_%s hw verify failed (c1=%08x/%08x c2=%08x/%u c3=%08x/1 scale=%u/4096 dm1=%08x/%08x/%08x), reverting to native\n",
+		v.route == DV_STD_ROUTE_YCC ? "ycc" : "ipt",
+		c1_ctrl, v.exp_c1_ctrl, c2_ctrl, v.exp_c2_ctrl_bit0,
+		c3_mode, c3_scale, dm1_2, dm1_3, dm1_4);
+
+	if ((!new_dovi_setting.video_width || !new_dovi_setting.video_height) &&
+	    dovi_setting.video_width && dovi_setting.video_height) {
+		new_dovi_setting.video_width = dovi_setting.video_width;
+		new_dovi_setting.video_height = dovi_setting.video_height;
+	}
+	dolby_vision_set_toggle_flag(1);
 }
 
 static void apply_stb_core_settings
@@ -3492,9 +3559,6 @@ static void apply_stb_core_settings
     dm1 = dv_std_ipt_work.dm1;
     dm2 = dv_std_ipt_work.dm2;
     dm3 = dv_std_ipt_work.dm3;
-    md3 = &dv_std_ipt_private_md;
-  } else if (ipt.native_refresh && !ycc.active && !ycc.native_refresh) {
-    md3 = &dv_std_ipt_private_md;
   }
   /* A basis transition is one joint submission, including native restoration.
    * force_dm avoids comparisons against the deliberately native last_dm cache;
@@ -3504,10 +3568,6 @@ static void apply_stb_core_settings
     mask |= 7;
     reset = true;
   }
-  if (ipt.active && (ipt.metadata_changed ||
-                    ipt.cvm_active != READ_ONCE(dv_std_ipt_cvm_active) ||
-                    (ipt.cvm_active && dv_std_ipt_gui_cvm.changed)))
-    mask |= 6;
   programming_allowed = !(dolby_vision_on &&
     (dolby_vision_flags & FLAG_DISABE_CORE_SETTING));
 
@@ -3550,7 +3610,8 @@ static void apply_stb_core_settings
           reset,
           force_dm,
           ycc.active || ipt.active,
-          ycc.active && dv_std_ycc_work.bypass_csc1);
+          (ycc.active && dv_std_ycc_work.bypass_csc1) ||
+          (ipt.active && dv_std_ipt_work.bypass_csc1));
     }
   }
 
@@ -3566,27 +3627,22 @@ static void apply_stb_core_settings
       memcpy(&new_dovi_setting.dm_lut2, &dovi_setting.dm_lut2, sizeof(struct dm_lut_ipcore));
 
     /* Preserve the exact current native PQ/G2L block; only the four curve
-     * tables come from the private YCC black-level or neutral-profile generator.
+     * tables come from the private YCC black-level affine generator.
      */
     BUILD_BUG_ON(sizeof(dv_std_ycc_cvm_lut) != sizeof(new_dovi_setting.dm_lut2));
     if (ycc.active && ycc.cvm_active)
       memcpy(dv_std_ycc_cvm_lut + 1024,
              ((u32 *)&new_dovi_setting.dm_lut2) + 1024, 256 * sizeof(u32));
-    else if (ipt.active && ipt.cvm_active)
-      memcpy(dv_std_ipt_gui_cvm.lut + 1024,
-             ((u32 *)&new_dovi_setting.dm_lut2) + 1024, 256 * sizeof(u32));
     dolby_core2_set(
         dm2,
         (ycc.active && ycc.cvm_active) ? dv_std_ycc_cvm_lut :
-        (ipt.active && ipt.cvm_active) ? dv_std_ipt_gui_cvm.lut :
           (u32 *)&new_dovi_setting.dm_lut2,
         graphics_w,
         graphics_h,
         force_dm,
         ycc.active || ipt.active,
-        (ycc.active && ycc.cvm_active) || (ipt.active && ipt.cvm_active),
-        (ycc.active && ycc.cvm_active) ? &dv_std_ycc_cvm_uploads :
-        (ipt.active && ipt.cvm_active) ? &dv_std_ipt_cvm_uploads : NULL,
+        ycc.active && ycc.cvm_active,
+        (ycc.active && ycc.cvm_active) ? &dv_std_ycc_cvm_uploads : NULL,
         ycc.changed || ipt.changed);
   }
 
@@ -3940,18 +3996,9 @@ void enable_dolby_vision(int enable)
 					VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA1, 0x20002000); // 12->10 before vadj2 10->12 after gainoff
 				} else {
 					if (dolby_vision_flags & FLAG_BYPASS_VPP) video_effect_bypass(1);
-					if (xbmc_dv_deep_color) {
-						VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA0, 0x08000800);
-						VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA1, 0x08000800);
-						VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 0, 12, 1);
-						if (debug_dolby & 2) pr_dolby_dbg("xbmc_dv_deep_color=1 -> VPP_DAT_CONV 0x08000800 + DOLBY_CTRL bit12=0\n");
-					} else {
-						VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA0, 0x20002000); // 12->10 before vadj1 10->12 before post blend
-						VSYNC_WR_DV_REG(VPP_DAT_CONV_PARA1, 0x20002000); // 12->10 before vadj2 10->12 after gainoff
-						if (debug_dolby & 2) pr_dolby_dbg("xbmc_dv_deep_color=0 -> VPP_DAT_CONV 0x20002000 (12->10 truncate)\n");
-					}
 				}
 
+				dv_box2_output_precision(dvll, dolby_vision_mode, true);
 				VSYNC_WR_DV_REG(VPP_MATRIX_CTRL, 0);
 				VSYNC_WR_DV_REG(VPP_DUMMY_DATA1, 0x80200);
 
@@ -3973,12 +4020,6 @@ void enable_dolby_vision(int enable)
 					enable_rgb_to_yuv_matrix_for_dvll(0, NULL, 12);
 				}
 
-				if (xbmc_dv_deep_color &&
-				    dolby_vision_mode != DOLBY_VISION_OUTPUT_MODE_IPT_TUNNEL &&
-				    dolby_vision_mode != DOLBY_VISION_OUTPUT_MODE_IPT) {
-					WRITE_VPP_DV_REG_BITS(VPU_HDMI_FMT_CTRL, 1, 4, 1);
-					if (debug_dolby & 2) pr_dolby_dbg("xbmc_dv_deep_color HDMI dither bit set (mode=%d non-IPT)\n", dolby_vision_mode);
-				}
 
 				last_dolby_vision_ll_policy = dolby_vision_ll_policy;
 				if (debug_dolby & 2) pr_dolby_dbg("Dolby Vision G12a turn on%s\n", dolby_vision_core1_on ? ", core1 on" : "");
@@ -4126,10 +4167,15 @@ void enable_dolby_vision(int enable)
 					dv_mem_power_off(VPU_DOLBY0);
 				}
 
-				if (xbmc_dv_deep_color) {
+				if (dv_vpp_12bit_active || xbmc_dv_deep_color) {
 					VSYNC_WR_DV_REG_BITS(VPP_DOLBY_CTRL, 1, 12, 1);
+					dv_vpp_12bit_active = false;
+					if (debug_dolby & 2) pr_dolby_dbg("vpp 12-bit DV-off cleanup: restore DOLBY_CTRL bit12\n");
+				}
+				if (dv_hdmi_dither_active || xbmc_dv_deep_color) {
 					WRITE_VPP_DV_REG_BITS(VPU_HDMI_FMT_CTRL, 0, 4, 1);
-					if (debug_dolby & 2) pr_dolby_dbg("xbmc_dv_deep_color DV-off cleanup: restore DOLBY_CTRL bit12 + clear HDMI dither\n");
+					dv_hdmi_dither_active = false;
+					if (debug_dolby & 2) pr_dolby_dbg("xbmc_dv_deep_color DV-off cleanup: clear HDMI dither\n");
 				}
 
 				{
@@ -7702,8 +7748,7 @@ int dolby_vision_parse_metadata(struct vframe_s *vf,
 		dovi_setting_video_flag = video_frame;
 		dv_std_ycc_latch_source(vf, ycc_parse_epoch,
 			md_buf[current_id], md_size_use,
-			src_format == FORMAT_DOVI && dst_format == FORMAT_DOVI,
-			graphic_min, graphic_max, pri_mode);
+			src_format == FORMAT_DOVI && dst_format == FORMAT_DOVI);
 
 		if (debug_dolby & 1)
 		{
@@ -8388,6 +8433,8 @@ int dolby_vision_process(struct vframe_s *vf,
 		if (debug_dolby & 0x100)
 			pr_dolby_dbg("Need update core2 first %d times\n", dolby_vision_core2_on_cnt);
 	}
+
+	dv_std_direct_check_hw_verify();
 
 	if (dolby_vision_flags & FLAG_TOGGLE_FRAME)
 	{

@@ -16,6 +16,9 @@ static const s32 s1[9] = {9574, 0, 13802, 9574, -1540, -5348, 9574, 17610, 0};
 static const s32 s2[9] = {7222, 8771, 390, 2654, 12430, 1300, 0, 422, 15962};
 static const s32 o1[9] = {8194, 799, 1681, 8194, -933, 1091, 8194, 267, -5545};
 static const s32 o2[9] = {17080, -348, -348, -348, 17080, -348, -348, -348, 17080};
+static const s32 p5_s1[9] = {8192, 799, 1681, 8192, -933, 1091, 8192, 267, -5545};
+static const s32 p5_s2[9] = {17081, -349, -349, -349, 17081, -349, -349, -349, 17081};
+static const s32 p5_native_a2b[9] = {31372, 698, 698, 698, 31372, 698, 698, 698, 31372};
 static const u32 native_video[5] = {
 	0x430f34bd, 0x15550833, 0x0e745c36, 0x09a90316, 0x000f7341
 };
@@ -222,6 +225,133 @@ static void measured_fixture(void)
 	}
 }
 
+static void p5_fixture(struct fixture *f)
+{
+	struct dv_std_ipt_matrix m;
+	int i;
+
+	fixture(f);
+	metadata(f->source, p5_s1, p5_s2, true);
+	f->source[62] = 0; /* Real P5 source streams are 4:2:0 (md[62]=0, md[63]=1). */
+	f->dm1[2] = 0x100100;
+	f->dm1[3] = 0x08000000;
+	f->dm1[4] = 2048;
+	for (i = 0; i < 9; i++)
+		m.c[i] = p5_s1[i];
+	m.shift = 13;
+	dv_std_ipt_pack(&m, f->dm1 + 5);
+	for (i = 0; i < 3; i++)
+		f->dm1[10 + i] = p5_s1[3 * i + 1] * 2048 +
+			p5_s1[3 * i + 2] * 2048;
+	for (i = 0; i < 9; i++)
+		m.c[i] = p5_native_a2b[i];
+	m.shift = 15;
+	dv_std_ipt_pack(&m, f->dm1 + 14);
+}
+
+static void profile5_tests(void)
+{
+	struct fixture f;
+	struct dv_std_ipt_setting out;
+	struct dv_std_ipt_matrix a, g, decoded;
+	s64 adj[9], det, num[9], row;
+	s32 expected[3], target;
+	int i, r, c, k, result;
+
+	/* Real 2026 P5 IPT-PQ-C2 fixture (source M1 col0=8192, M2=[17081,-349]). */
+	p5_fixture(&f);
+	result = dv_std_ipt_build(&f.in, &out);
+	if (result)
+		fprintf(stderr, "p5 fixture failed: %s\n", dv_std_ipt_result_name(result));
+	CHECK(result == 0);
+	CHECK(out.core3_mode == 1 && out.bypass_csc1 && out.bypass_cvm1 &&
+	      out.bypass_cvm2 && out.gui_rebased);
+	CHECK(out.dm1[2] == 0x100000 && out.dm1[3] == 0x08000000 &&
+	      out.dm1[4] == 2048);
+	CHECK(!memcmp(out.dm1 + 14, f.dm1 + 14, 10 * sizeof(u32)));
+	CHECK(!memcmp(out.dm2 + 17, mark14_c, sizeof(mark14_c)));
+	CHECK(out.dm3[12] == 4096 && !out.dm3[13] &&
+	      out.dm3[14] == 2048 && out.dm3[15] == 2048);
+	/* Independent signed128 oracle for Ag' = inv(p5_native_a2b) * native_gui. */
+	CHECK(dv_std_ipt_decode(f.dm1 + 14, &a));
+	CHECK(dv_std_ipt_decode(native_gui, &g));
+	CHECK(dv_std_ipt_inverse_data(&a, adj, &det));
+	for (r = 0; r < 3; r++)
+		for (c = 0; c < 3; c++) {
+			num[3 * r + c] = 0;
+			for (k = 0; k < 3; k++)
+				num[3 * r + c] += adj[3 * r + k] * g.c[3 * k + c];
+		}
+	CHECK(dv_std_ipt_decode(out.dm2 + 12, &decoded));
+	CHECK(decoded.shift == 15);
+	for (r = 0; r < 3; r++) {
+		row = num[3 * r] + num[3 * r + 1] + num[3 * r + 2];
+		target = oracle_round((__int128)row << 15, det);
+		oracle_row(num + 3 * r, det, 15, target, expected);
+		for (i = 0; i < 3; i++)
+			CHECK(decoded.c[3 * r + i] == expected[i]);
+	}
+
+	/* Exact identical source/output P5 M1/M2 also passes. */
+	p5_fixture(&f);
+	metadata(f.source, o1, o2, true);
+	for (i = 0; i < 9; i++)
+		a.c[i] = o1[i];
+	a.shift = 13;
+	dv_std_ipt_pack(&a, f.dm1 + 5);
+	for (i = 0; i < 3; i++)
+		f.dm1[10 + i] = o1[3 * i + 1] * 2048 + o1[3 * i + 2] * 2048;
+	CHECK(dv_std_ipt_build(&f.in, &out) == 0);
+	CHECK(out.bypass_csc1 && out.bypass_cvm1 && out.bypass_cvm2);
+
+	/* 4:2:2 and 4:4:4 P5 chroma formats also pass. */
+	p5_fixture(&f); f.source[62] = 1;
+	CHECK(dv_std_ipt_build(&f.in, &out) == 0 && out.bypass_csc1);
+	p5_fixture(&f); f.source[62] = 2;
+	CHECK(dv_std_ipt_build(&f.in, &out) == 0 && out.bypass_csc1);
+
+	/* Fail-closed P5 boundary checks. */
+	p5_fixture(&f); f.source[62] = 3; /* Invalid chroma format. */
+	atomic_failure(&f, DV_STD_IPT_BAD_SOURCE);
+	p5_fixture(&f); f.source[63] = 0; /* Limited range P5 unsupported. */
+	atomic_failure(&f, DV_STD_IPT_BAD_SOURCE);
+	p5_fixture(&f); put32(f.source + 20, 0x01000000); /* Non-zero I offset. */
+	atomic_failure(&f, DV_STD_IPT_BAD_SOURCE);
+	p5_fixture(&f); put32(f.source + 24, 0x07ff0000); /* Non-2048 P offset. */
+	atomic_failure(&f, DV_STD_IPT_BAD_SOURCE);
+	p5_fixture(&f); /* 0%-crosstalk IPT-PQ-C1 M2 must be rejected. */
+	for (i = 0; i < 9; i++)
+		put16(f.source + 32 + 2 * i, (i % 4) ? 0 : 16384);
+	atomic_failure(&f, DV_STD_IPT_BAD_SOURCE);
+	p5_fixture(&f); /* 4%-crosstalk M2 must be rejected. */
+	for (i = 0; i < 9; i++)
+		put16(f.source + 32 + 2 * i, (i % 4) ? -692 : 17840);
+	atomic_failure(&f, DV_STD_IPT_BAD_SOURCE);
+	p5_fixture(&f); put16(f.source + 32, o2[0] + 3); /* >2 LSB M2 diff. */
+	atomic_failure(&f, DV_STD_IPT_BAD_SOURCE);
+	p5_fixture(&f); put16(f.source + 4, o1[1] + 2); /* >1 LSB M1 chroma diff. */
+	a.shift = 13;
+	for (i = 0; i < 9; i++)
+		a.c[i] = p5_s1[i];
+	a.c[1] = o1[1] + 2;
+	dv_std_ipt_pack(&a, f.dm1 + 5);
+	f.dm1[10] = a.c[1] * 2048 + a.c[2] * 2048;
+	atomic_failure(&f, DV_STD_IPT_BAD_SOURCE);
+	p5_fixture(&f); put16(f.source + 2, 8191); /* Col 0 < 8192. */
+	a.shift = 13;
+	for (i = 0; i < 9; i++)
+		a.c[i] = p5_s1[i];
+	a.c[0] = 8191;
+	dv_std_ipt_pack(&a, f.dm1 + 5);
+	atomic_failure(&f, DV_STD_IPT_BAD_SOURCE);
+	p5_fixture(&f); f.dm1[5]++; /* Hardware y2rgb mismatch. */
+	atomic_failure(&f, DV_STD_IPT_SOURCE_MISMATCH);
+	p5_fixture(&f); f.dm1[10]++; /* Hardware y2rgb_off mismatch. */
+	atomic_failure(&f, DV_STD_IPT_SOURCE_MISMATCH);
+	p5_fixture(&f); memset(f.dm1 + 14, 0, 5 * sizeof(u32));
+	atomic_failure(&f, DV_STD_IPT_BAD_GUI);
+}
+
 static void failures(void)
 {
 	struct fixture f;
@@ -237,7 +367,9 @@ static void failures(void)
 	atomic_failure(&f, DV_STD_IPT_BAD_MODE);
 	fixture(&f); f.dm1[1] = 0x10000;
 	atomic_failure(&f, DV_STD_IPT_BAD_MODE);
-	fixture(&f); f.source[61] = 2; /* P5/RGB is explicitly unsupported. */
+	fixture(&f); f.source[61] = 1; /* RGB source is explicitly unsupported. */
+	atomic_failure(&f, DV_STD_IPT_BAD_SOURCE);
+	fixture(&f); f.source[61] = 2; /* Non-matching P5 metadata/range rejected. */
 	atomic_failure(&f, DV_STD_IPT_BAD_SOURCE);
 	fixture(&f); f.output[61] = 0;
 	atomic_failure(&f, DV_STD_IPT_BAD_OUTPUT);
@@ -344,6 +476,7 @@ static void random_exact(void)
 int main(void)
 {
 	measured_fixture();
+	profile5_tests();
 	failures();
 	random_exact();
 	printf("dv_std_ipt: %u checks passed\n", checks);
